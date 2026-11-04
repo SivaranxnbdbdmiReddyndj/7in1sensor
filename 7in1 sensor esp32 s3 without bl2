@@ -1,0 +1,552 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_SHT4x.h>
+#include <math.h>
+
+// =====================================================
+//       ESP32-S3 N16R8 AGRICULTURE SENSOR SYSTEM
+// =====================================================
+
+// ---------- RS485 / JXBS 7-IN-1 ----------
+#define RS485_RX       41
+#define RS485_TX       42
+#define RS485_DE_RE    1
+
+// ---------- SHT40 ----------
+#define SHT40_SDA      21
+#define SHT40_SCL      22
+
+// ---------- ANALOG SENSORS ----------
+#define TURBIDITY_PIN  19
+#define TDS_PIN        20
+
+// ---------- OBJECTS ----------
+HardwareSerial RS485Serial(2);
+Adafruit_SHT4x sht40;
+
+bool sht40OK = false;
+
+// =====================================================
+// TDS CALIBRATION
+// =====================================================
+
+#define TDS_CAL_FACTOR 10.133042
+#define TDS_WATER_TEMP 25.0
+
+// =====================================================
+// MODBUS CRC16
+// =====================================================
+
+uint16_t modbusCRC(uint8_t *buffer, uint8_t length) {
+
+  uint16_t crc = 0xFFFF;
+
+  for (uint8_t pos = 0; pos < length; pos++) {
+
+    crc ^= buffer[pos];
+
+    for (uint8_t i = 0; i < 8; i++) {
+
+      if (crc & 0x0001)
+        crc = (crc >> 1) ^ 0xA001;
+      else
+        crc >>= 1;
+    }
+  }
+
+  return crc;
+}
+
+// =====================================================
+// READ SINGLE MODBUS REGISTER
+// =====================================================
+
+int16_t readRegister(uint16_t reg) {
+
+  uint8_t request[8];
+
+  request[0] = 0x01;
+  request[1] = 0x03;
+  request[2] = highByte(reg);
+  request[3] = lowByte(reg);
+  request[4] = 0x00;
+  request[5] = 0x01;
+
+  uint16_t crc = modbusCRC(request, 6);
+
+  request[6] = lowByte(crc);
+  request[7] = highByte(crc);
+
+  while (RS485Serial.available())
+    RS485Serial.read();
+
+  // Transmit mode
+  digitalWrite(RS485_DE_RE, HIGH);
+  delayMicroseconds(200);
+
+  RS485Serial.write(request, 8);
+  RS485Serial.flush();
+
+  delayMicroseconds(200);
+
+  // Receive mode
+  digitalWrite(RS485_DE_RE, LOW);
+
+  uint8_t response[7];
+  uint8_t index = 0;
+
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < 1000) {
+
+    if (RS485Serial.available()) {
+
+      if (index < sizeof(response)) {
+        response[index++] = RS485Serial.read();
+      } else {
+        RS485Serial.read();
+      }
+
+      if (index >= 7)
+        break;
+    }
+  }
+
+  if (index != 7)
+    return -9999;
+
+  if (response[0] != 0x01 ||
+      response[1] != 0x03 ||
+      response[2] != 0x02)
+    return -9999;
+
+  uint16_t receivedCRC =
+      response[5] | (response[6] << 8);
+
+  uint16_t calculatedCRC =
+      modbusCRC(response, 5);
+
+  if (receivedCRC != calculatedCRC)
+    return -9999;
+
+  uint16_t value =
+      (response[3] << 8) | response[4];
+
+  return value;
+}
+
+// =====================================================
+// READ NPK
+// =====================================================
+
+bool readNPK(int &N, int &P, int &K) {
+
+  uint8_t request[8];
+
+  request[0] = 0x01;
+  request[1] = 0x03;
+
+  request[2] = 0x00;
+  request[3] = 0x1E;
+
+  request[4] = 0x00;
+  request[5] = 0x03;
+
+  uint16_t crc = modbusCRC(request, 6);
+
+  request[6] = lowByte(crc);
+  request[7] = highByte(crc);
+
+  while (RS485Serial.available())
+    RS485Serial.read();
+
+  digitalWrite(RS485_DE_RE, HIGH);
+  delayMicroseconds(200);
+
+  RS485Serial.write(request, 8);
+  RS485Serial.flush();
+
+  delayMicroseconds(200);
+
+  digitalWrite(RS485_DE_RE, LOW);
+
+  uint8_t response[11];
+  uint8_t index = 0;
+
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < 1000) {
+
+    if (RS485Serial.available()) {
+
+      if (index < sizeof(response)) {
+        response[index++] = RS485Serial.read();
+      } else {
+        RS485Serial.read();
+      }
+
+      if (index >= 11)
+        break;
+    }
+  }
+
+  if (index != 11)
+    return false;
+
+  if (response[0] != 0x01 ||
+      response[1] != 0x03 ||
+      response[2] != 0x06)
+    return false;
+
+  uint16_t receivedCRC =
+      response[9] | (response[10] << 8);
+
+  uint16_t calculatedCRC =
+      modbusCRC(response, 9);
+
+  if (receivedCRC != calculatedCRC)
+    return false;
+
+  N = (response[3] << 8) | response[4];
+  P = (response[5] << 8) | response[6];
+  K = (response[7] << 8) | response[8];
+
+  return true;
+}
+
+// =====================================================
+// TURBIDITY READING
+// =====================================================
+
+void readTurbidity(int &adcValue, float &voltage) {
+
+  long total = 0;
+
+  const int samples = 50;
+
+  for (int i = 0; i < samples; i++) {
+
+    total += analogRead(TURBIDITY_PIN);
+    delay(5);
+  }
+
+  adcValue = total / samples;
+
+  voltage = (adcValue / 4095.0) * 3.3;
+}
+
+// =====================================================
+// TDS READING
+// =====================================================
+
+void readTDS(int &adcValue, float &voltage, float &tds) {
+
+  long total = 0;
+
+  const int samples = 30;
+
+  for (int i = 0; i < samples; i++) {
+
+    total += analogRead(TDS_PIN);
+    delay(3);
+  }
+
+  adcValue = total / samples;
+
+  voltage = (adcValue / 4095.0) * 3.3;
+
+  float compensationCoefficient =
+      1.0 + 0.02 * (TDS_WATER_TEMP - 25.0);
+
+  float compensationVoltage =
+      voltage / compensationCoefficient;
+
+  float calculatedTDS =
+      (
+        133.42 * pow(compensationVoltage, 3)
+        -
+        255.86 * pow(compensationVoltage, 2)
+        +
+        857.39 * compensationVoltage
+      ) * 0.5;
+
+  tds = calculatedTDS * TDS_CAL_FACTOR;
+
+  if (tds < 0)
+    tds = 0;
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println();
+  Serial.println("================================================");
+  Serial.println("    ESP32-S3 AGRICULTURE SENSOR SYSTEM");
+  Serial.println("================================================");
+
+  Serial.println("Board: ESP32-S3 N16R8");
+
+  Serial.printf("Flash: %u MB\n",
+    ESP.getFlashChipSize() / (1024 * 1024));
+
+  Serial.printf("PSRAM: %u bytes\n",
+    ESP.getPsramSize());
+
+  // -------------------------------------------------
+  // RS485
+  // -------------------------------------------------
+
+  pinMode(RS485_DE_RE, OUTPUT);
+
+  digitalWrite(RS485_DE_RE, LOW);
+
+  RS485Serial.begin(
+    9600,
+    SERIAL_8N1,
+    RS485_RX,
+    RS485_TX
+  );
+
+  Serial.println("\nRS485 initialized");
+  Serial.printf("RX: GPIO %d\n", RS485_RX);
+  Serial.printf("TX: GPIO %d\n", RS485_TX);
+  Serial.printf("DE/RE: GPIO %d\n", RS485_DE_RE);
+
+  // -------------------------------------------------
+  // ADC CONFIGURATION
+  // -------------------------------------------------
+
+  analogReadResolution(12);
+
+  analogSetPinAttenuation(TURBIDITY_PIN, ADC_11db);
+  analogSetPinAttenuation(TDS_PIN, ADC_11db);
+
+  Serial.println("\nAnalog sensors initialized");
+
+  // -------------------------------------------------
+  // SHT40
+  // -------------------------------------------------
+
+  Wire.begin(SHT40_SDA, SHT40_SCL);
+
+  sht40OK = sht40.begin();
+
+  if (!sht40OK) {
+
+    Serial.println("ERROR: SHT40 NOT FOUND!");
+
+  } else {
+
+    Serial.println("SHT40 detected!");
+
+    sht40.setPrecision(SHT4X_HIGH_PRECISION);
+    sht40.setHeater(SHT4X_NO_HEATER);
+  }
+
+  // -------------------------------------------------
+  // SYSTEM STATUS
+  // -------------------------------------------------
+
+  Serial.println("\nPin Configuration:");
+
+  Serial.println("RS485       : GPIO 41, 42, 1");
+  Serial.println("SHT40       : GPIO 21, 22");
+  Serial.println("Turbidity   : GPIO 19");
+  Serial.println("TDS         : GPIO 20");
+
+  Serial.println("\nSystem Ready!");
+  Serial.println("================================================");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop() {
+
+  // -------------------------------------------------
+  // JXBS 7-IN-1 SOIL SENSOR
+  // -------------------------------------------------
+
+  int16_t rawPH = readRegister(0x0006);
+  delay(100);
+
+  int16_t rawMoisture = readRegister(0x0012);
+  delay(100);
+
+  int16_t rawSoilTemp = readRegister(0x0013);
+  delay(100);
+
+  int16_t rawEC = readRegister(0x0015);
+  delay(100);
+
+  // -------------------------------------------------
+  // NPK
+  // -------------------------------------------------
+
+  int N = 0;
+  int P = 0;
+  int K = 0;
+
+  bool npkOK = readNPK(N, P, K);
+
+  // -------------------------------------------------
+  // SOIL VALUES
+  // -------------------------------------------------
+
+  float soilPH = -1;
+  float soilMoisture = -1;
+  float soilTemperature = -9999;
+  float soilEC = -1;
+
+  if (rawPH >= 0)
+    soilPH = rawPH / 100.0;
+
+  if (rawMoisture >= 0)
+    soilMoisture = rawMoisture / 10.0;
+
+  if (rawSoilTemp != -9999) {
+    soilTemperature =
+        (int16_t)rawSoilTemp / 10.0;
+  }
+
+  if (rawEC >= 0)
+    soilEC = rawEC;
+
+  // -------------------------------------------------
+  // SHT40
+  // -------------------------------------------------
+
+  float airTemperature = NAN;
+  float airHumidity = NAN;
+
+  if (sht40OK) {
+
+    sensors_event_t humidityEvent;
+    sensors_event_t temperatureEvent;
+
+    if (sht40.getEvent(
+          &humidityEvent,
+          &temperatureEvent)) {
+
+      airTemperature = temperatureEvent.temperature;
+      airHumidity = humidityEvent.relative_humidity;
+    }
+  }
+
+  // -------------------------------------------------
+  // TURBIDITY
+  // -------------------------------------------------
+
+  int turbidityADC = 0;
+  float turbidityVoltage = 0;
+
+  readTurbidity(
+    turbidityADC,
+    turbidityVoltage
+  );
+
+  // -------------------------------------------------
+  // TDS
+  // -------------------------------------------------
+
+  int tdsADC = 0;
+  float tdsVoltage = 0;
+  float tdsPPM = 0;
+
+  readTDS(
+    tdsADC,
+    tdsVoltage,
+    tdsPPM
+  );
+
+  // -------------------------------------------------
+  // OUTPUT
+  // -------------------------------------------------
+
+  Serial.println();
+  Serial.println("================================================");
+  Serial.println("                 SENSOR READINGS");
+  Serial.println("================================================");
+
+  // JXBS SOIL
+
+  Serial.println("\n------------- JXBS 7-IN-1 SOIL ----------------");
+
+  if (soilPH >= 0)
+    Serial.printf("Soil pH          : %.2f\n", soilPH);
+  else
+    Serial.println("Soil pH          : ERROR");
+
+  if (soilMoisture >= 0)
+    Serial.printf("Soil Moisture    : %.1f %%\n", soilMoisture);
+  else
+    Serial.println("Soil Moisture    : ERROR");
+
+  if (soilTemperature != -9999)
+    Serial.printf("Soil Temperature : %.1f C\n", soilTemperature);
+  else
+    Serial.println("Soil Temperature : ERROR");
+
+  if (soilEC >= 0)
+    Serial.printf("Soil EC          : %.0f uS/cm\n", soilEC);
+  else
+    Serial.println("Soil EC          : ERROR");
+
+  // NPK
+
+  if (npkOK) {
+
+    Serial.printf("Nitrogen (N)     : %d mg/kg\n", N);
+    Serial.printf("Phosphorus (P)   : %d mg/kg\n", P);
+    Serial.printf("Potassium (K)    : %d mg/kg\n", K);
+
+  } else {
+
+    Serial.println("Nitrogen (N)     : ERROR");
+    Serial.println("Phosphorus (P)   : ERROR");
+    Serial.println("Potassium (K)    : ERROR");
+  }
+
+  // SHT40
+
+  Serial.println("\n---------------- SHT40 AIR --------------------");
+
+  if (!isnan(airTemperature))
+    Serial.printf("Air Temperature  : %.2f C\n", airTemperature);
+  else
+    Serial.println("Air Temperature  : ERROR");
+
+  if (!isnan(airHumidity))
+    Serial.printf("Air Humidity     : %.2f %%\n", airHumidity);
+  else
+    Serial.println("Air Humidity     : ERROR");
+
+  // TURBIDITY
+
+  Serial.println("\n---------------- TURBIDITY --------------------");
+
+  Serial.printf("Turbidity ADC    : %d\n", turbidityADC);
+  Serial.printf("Turbidity Voltage: %.4f V\n", turbidityVoltage);
+
+  Serial.println("Turbidity        : NOT CALIBRATED");
+
+  // TDS
+
+  Serial.println("\n---------------- TDS METER --------------------");
+
+  Serial.printf("TDS ADC          : %d\n", tdsADC);
+  Serial.printf("TDS Voltage      : %.4f V\n", tdsVoltage);
+  Serial.printf("TDS              : %.2f ppm\n", tdsPPM);
+  Serial.printf("Water Temp Used  : %.1f C\n", TDS_WATER_TEMP);
+
+  Serial.println("\n================================================");
+
+  delay(5000);
+}

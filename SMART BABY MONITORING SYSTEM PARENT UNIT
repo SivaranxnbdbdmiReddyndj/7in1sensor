@@ -1,0 +1,246 @@
+/*
+=====================================================
+SMART BABY MONITORING SYSTEM
+PARENT UNIT
+ESP32 + ESP-NOW
+
+Outputs
+1. LED
+2. Active Buzzer
+3. Vibration Motor
+
+=====================================================
+*/
+
+#include <WiFi.h>
+#include <esp_now.h>
+
+//=====================================================
+// DATA STRUCTURE
+// Must be IDENTICAL to Baby Unit
+//=====================================================
+
+typedef struct
+{
+  int soundLevel;
+  float temperature;
+  float pressure;
+  float distance;
+
+  bool babyCry;
+  bool babyPresent;
+
+  bool roomHot;
+  bool roomCold;
+
+  int systemStatus;
+
+} BabyData;
+
+BabyData data;
+
+//=====================================================
+// OUTPUT PINS
+//=====================================================
+
+const int ledPin = 2;
+const int buzzerPin = 4;
+const int motorPin = 5;
+
+//=====================================================
+// COMMUNICATION TIMEOUT
+//=====================================================
+
+unsigned long lastPacket = 0;
+const unsigned long TIMEOUT = 5000;
+
+//=====================================================
+// RECEIVE CALLBACK
+//=====================================================
+
+void OnDataRecv(const esp_now_recv_info_t *info,
+                const uint8_t *incomingData,
+                int len)
+{
+  memcpy(&data, incomingData, sizeof(data));
+
+  lastPacket = millis();
+
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println(" SMART BABY MONITOR ");
+  Serial.println("=================================");
+
+  Serial.print("Sound Level : ");
+  Serial.println(data.soundLevel);
+
+  Serial.print("Temperature : ");
+  Serial.print(data.temperature);
+  Serial.println(" C");
+
+  Serial.print("Pressure : ");
+  Serial.print(data.pressure);
+  Serial.println(" hPa");
+
+  Serial.print("Distance : ");
+  Serial.print(data.distance);
+  Serial.println(" cm");
+
+  Serial.println("--------------------------------");
+
+  Serial.print("Baby Present : ");
+  Serial.println(data.babyPresent);
+
+  Serial.print("Baby Cry : ");
+  Serial.println(data.babyCry);
+
+  Serial.print("Room Hot : ");
+  Serial.println(data.roomHot);
+
+  Serial.print("Room Cold : ");
+  Serial.println(data.roomCold);
+
+  Serial.print("System Status : ");
+  Serial.println(data.systemStatus);
+
+  Serial.println("--------------------------------");
+
+  digitalWrite(ledPin, LOW);
+  digitalWrite(buzzerPin, LOW);
+  digitalWrite(motorPin, LOW);
+
+  //==================================
+  // BABY NOT PRESENT
+  //==================================
+
+  if (data.systemStatus == 2)
+  {
+    Serial.println("BABY NOT PRESENT");
+
+    digitalWrite(ledPin, HIGH);
+    digitalWrite(motorPin, HIGH);
+    digitalWrite(buzzerPin, HIGH);
+  }
+
+  //==================================
+  // BABY CRYING
+  //==================================
+
+  else if (data.systemStatus == 1)
+  {
+    Serial.println("BABY CRY DETECTED");
+
+    digitalWrite(ledPin, HIGH);
+    digitalWrite(motorPin, HIGH);
+
+    digitalWrite(buzzerPin, HIGH);
+    delay(200);
+
+    digitalWrite(buzzerPin, LOW);
+    delay(200);
+
+    digitalWrite(buzzerPin, HIGH);
+    delay(200);
+
+    digitalWrite(buzzerPin, LOW);
+  }
+
+  //==================================
+  // TEMPERATURE ALERT
+  //==================================
+
+  else if (data.roomHot || data.roomCold)
+  {
+    Serial.println("ROOM TEMPERATURE ALERT");
+
+    digitalWrite(ledPin, HIGH);
+    digitalWrite(motorPin, HIGH);
+
+    digitalWrite(buzzerPin, HIGH);
+    delay(300);
+
+    digitalWrite(buzzerPin, LOW);
+  }
+
+  //==================================
+  // NORMAL
+  //==================================
+
+  else
+  {
+    Serial.println("BABY SAFE");
+
+    digitalWrite(ledPin, LOW);
+    digitalWrite(buzzerPin, LOW);
+    digitalWrite(motorPin, LOW);
+  }
+
+  Serial.println("=================================");
+}
+//=====================================================
+// SETUP
+//=====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // Configure Output Pins
+  pinMode(ledPin, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+  pinMode(motorPin, OUTPUT);
+
+  // Turn OFF all outputs initially
+  digitalWrite(ledPin, LOW);
+  digitalWrite(buzzerPin, LOW);
+  digitalWrite(motorPin, LOW);
+
+  // Configure ESP32 as Station
+  WiFi.mode(WIFI_STA);
+
+  Serial.println();
+  Serial.println("=================================");
+  Serial.println("SMART BABY MONITOR");
+  Serial.println("PARENT UNIT");
+  Serial.println("=================================");
+
+  Serial.print("Parent MAC Address : ");
+  Serial.println(WiFi.macAddress());
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK)
+  {
+    Serial.println("ESP-NOW Initialization Failed!");
+    while (true);
+  }
+
+  // Register Receive Callback
+  esp_now_register_recv_cb(OnDataRecv);
+
+  Serial.println();
+  Serial.println("ESP-NOW Ready");
+  Serial.println("Waiting for Baby Unit...");
+  Serial.println("=================================");
+}
+
+//=====================================================
+// LOOP
+//=====================================================
+
+void loop()
+{
+  // Check communication timeout
+  if (millis() - lastPacket > TIMEOUT)
+  {
+    Serial.println("COMMUNICATION LOST!");
+
+    digitalWrite(ledPin, HIGH);
+    digitalWrite(motorPin, HIGH);
+
+    // Slow buzzer beep
+    digitalWrite(buzzerPin, HIGH);
+    delay(500);
+    digitalWrite(buzzerPin, LOW);
+    delay(500);
+  }
+} ok

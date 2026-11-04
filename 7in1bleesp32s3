@@ -1,0 +1,529 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// =====================================================
+// ESP32-S3 N16R8 - JXBS 7-IN-1 + BLE
+// =====================================================
+
+// ---------- ORIGINAL RS485 WIRING ----------
+#define RS485_RX       41
+#define RS485_TX       42
+#define RS485_DE_RE     1
+
+#define MODBUS_BAUD    9600
+#define BLE_DEVICE_NAME "AGX-Node-1"
+
+#define SERVICE_UUID \
+  "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+
+#define CHARACTERISTIC_UUID \
+  "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+// ---------- OBJECTS ----------
+HardwareSerial RS485Serial(2);
+
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+
+bool deviceConnected = false;
+
+// =====================================================
+// BLE CALLBACKS
+// =====================================================
+
+class MyServerCallbacks : public BLEServerCallbacks {
+
+  void onConnect(BLEServer* server) override {
+    deviceConnected = true;
+    Serial.println("[BLE] Mobile connected");
+  }
+
+  void onDisconnect(BLEServer* server) override {
+    deviceConnected = false;
+    Serial.println("[BLE] Mobile disconnected");
+
+    BLEDevice::startAdvertising();
+    Serial.println("[BLE] Advertising restarted");
+  }
+};
+
+// =====================================================
+// MODBUS CRC16 - ORIGINAL LOGIC
+// =====================================================
+
+uint16_t modbusCRC(uint8_t *buffer, uint8_t length) {
+
+  uint16_t crc = 0xFFFF;
+
+  for (uint8_t pos = 0; pos < length; pos++) {
+
+    crc ^= buffer[pos];
+
+    for (uint8_t i = 0; i < 8; i++) {
+
+      if (crc & 0x0001)
+        crc = (crc >> 1) ^ 0xA001;
+      else
+        crc >>= 1;
+    }
+  }
+
+  return crc;
+}
+
+// =====================================================
+// READ SINGLE MODBUS REGISTER - ORIGINAL LOGIC
+// =====================================================
+
+int16_t readRegister(uint16_t reg) {
+
+  uint8_t request[8];
+
+  request[0] = 0x01;
+  request[1] = 0x03;
+  request[2] = highByte(reg);
+  request[3] = lowByte(reg);
+  request[4] = 0x00;
+  request[5] = 0x01;
+
+  uint16_t crc = modbusCRC(request, 6);
+
+  request[6] = lowByte(crc);
+  request[7] = highByte(crc);
+
+  while (RS485Serial.available())
+    RS485Serial.read();
+
+  digitalWrite(RS485_DE_RE, HIGH);
+  delayMicroseconds(200);
+
+  RS485Serial.write(request, 8);
+  RS485Serial.flush();
+
+  delayMicroseconds(200);
+
+  digitalWrite(RS485_DE_RE, LOW);
+
+  uint8_t response[7];
+  uint8_t index = 0;
+
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < 1000) {
+
+    if (RS485Serial.available()) {
+
+      if (index < sizeof(response)) {
+        response[index++] = RS485Serial.read();
+      } else {
+        RS485Serial.read();
+      }
+
+      if (index >= 7)
+        break;
+    }
+  }
+
+  if (index != 7)
+    return -9999;
+
+  if (response[0] != 0x01 ||
+      response[1] != 0x03 ||
+      response[2] != 0x02)
+    return -9999;
+
+  uint16_t receivedCRC =
+      response[5] | (response[6] << 8);
+
+  uint16_t calculatedCRC =
+      modbusCRC(response, 5);
+
+  if (receivedCRC != calculatedCRC)
+    return -9999;
+
+  uint16_t value =
+      (response[3] << 8) | response[4];
+
+  return value;
+}
+
+// =====================================================
+// READ NPK - ORIGINAL LOGIC
+// =====================================================
+
+bool readNPK(int &N, int &P, int &K) {
+
+  uint8_t request[8];
+
+  request[0] = 0x01;
+  request[1] = 0x03;
+
+  request[2] = 0x00;
+  request[3] = 0x1E;
+
+  request[4] = 0x00;
+  request[5] = 0x03;
+
+  uint16_t crc = modbusCRC(request, 6);
+
+  request[6] = lowByte(crc);
+  request[7] = highByte(crc);
+
+  while (RS485Serial.available())
+    RS485Serial.read();
+
+  digitalWrite(RS485_DE_RE, HIGH);
+  delayMicroseconds(200);
+
+  RS485Serial.write(request, 8);
+  RS485Serial.flush();
+
+  delayMicroseconds(200);
+
+  digitalWrite(RS485_DE_RE, LOW);
+
+  uint8_t response[11];
+  uint8_t index = 0;
+
+  unsigned long startTime = millis();
+
+  while (millis() - startTime < 1000) {
+
+    if (RS485Serial.available()) {
+
+      if (index < sizeof(response)) {
+        response[index++] = RS485Serial.read();
+      } else {
+        RS485Serial.read();
+      }
+
+      if (index >= 11)
+        break;
+    }
+  }
+
+  if (index != 11)
+    return false;
+
+  if (response[0] != 0x01 ||
+      response[1] != 0x03 ||
+      response[2] != 0x06)
+    return false;
+
+  uint16_t receivedCRC =
+      response[9] | (response[10] << 8);
+
+  uint16_t calculatedCRC =
+      modbusCRC(response, 9);
+
+  if (receivedCRC != calculatedCRC)
+    return false;
+
+  N = (response[3] << 8) | response[4];
+  P = (response[5] << 8) | response[6];
+  K = (response[7] << 8) | response[8];
+
+  return true;
+}
+
+// =====================================================
+// BLE JSON TRANSMISSION
+// =====================================================
+
+void sendBLEData(
+  float soilPH,
+  float soilMoisture,
+  float soilTemperature,
+  float soilEC,
+  int N,
+  int P,
+  int K,
+  bool npkOK
+) {
+
+  if (!deviceConnected || pCharacteristic == nullptr)
+    return;
+
+  char json[350];
+
+  char phValue[20];
+  char moistureValue[20];
+  char temperatureValue[20];
+  char ecValue[20];
+
+  if (soilPH >= 0)
+    snprintf(phValue, sizeof(phValue), "%.2f", soilPH);
+  else
+    strcpy(phValue, "null");
+
+  if (soilMoisture >= 0)
+    snprintf(moistureValue, sizeof(moistureValue), "%.1f", soilMoisture);
+  else
+    strcpy(moistureValue, "null");
+
+  if (soilTemperature != -9999)
+    snprintf(temperatureValue, sizeof(temperatureValue), "%.1f", soilTemperature);
+  else
+    strcpy(temperatureValue, "null");
+
+  if (soilEC >= 0)
+    snprintf(ecValue, sizeof(ecValue), "%.0f", soilEC);
+  else
+    strcpy(ecValue, "null");
+
+  char nValue[20], pValue[20], kValue[20];
+
+  if (npkOK) {
+    snprintf(nValue, sizeof(nValue), "%d", N);
+    snprintf(pValue, sizeof(pValue), "%d", P);
+    snprintf(kValue, sizeof(kValue), "%d", K);
+  } else {
+    strcpy(nValue, "null");
+    strcpy(pValue, "null");
+    strcpy(kValue, "null");
+  }
+
+  bool sensorOK =
+    soilPH >= 0 &&
+    soilMoisture >= 0 &&
+    soilTemperature != -9999 &&
+    soilEC >= 0 &&
+    npkOK;
+
+  snprintf(
+    json,
+    sizeof(json),
+    "{"
+      "\"device\":\"%s\","
+      "\"soil_ph\":%s,"
+      "\"soil_moisture\":%s,"
+      "\"soil_temp\":%s,"
+      "\"soil_ec\":%s,"
+      "\"nitrogen\":%s,"
+      "\"phosphorus\":%s,"
+      "\"potassium\":%s,"
+      "\"sensor_ok\":%s"
+    "}",
+    BLE_DEVICE_NAME,
+    phValue,
+    moistureValue,
+    temperatureValue,
+    ecValue,
+    nValue,
+    pValue,
+    kValue,
+    sensorOK ? "true" : "false"
+  );
+
+  pCharacteristic->setValue(
+    (uint8_t*)json,
+    strlen(json)
+  );
+
+  pCharacteristic->notify();
+
+  Serial.println();
+  Serial.println("[BLE] Notification sent:");
+  Serial.println(json);
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup() {
+
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println(" ESP32-S3 JXBS 7-IN-1 + BLE");
+  Serial.println("========================================");
+
+  Serial.printf(
+    "Flash: %u MB\n",
+    ESP.getFlashChipSize() / (1024 * 1024)
+  );
+
+  Serial.printf(
+    "PSRAM: %u bytes\n",
+    ESP.getPsramSize()
+  );
+
+  // ---------- RS485 ----------
+
+  pinMode(RS485_DE_RE, OUTPUT);
+  digitalWrite(RS485_DE_RE, LOW);
+
+  RS485Serial.begin(
+    MODBUS_BAUD,
+    SERIAL_8N1,
+    RS485_RX,
+    RS485_TX
+  );
+
+  Serial.println("\n[RS485] Initialized");
+  Serial.println("RX: GPIO 41");
+  Serial.println("TX: GPIO 42");
+  Serial.println("DE/RE: GPIO 1");
+  Serial.println("Baud: 9600");
+
+  // ---------- BLE ----------
+
+  Serial.println("\n[BLE] Initializing...");
+
+  BLEDevice::init(BLE_DEVICE_NAME);
+  BLEDevice::setMTU(200);
+
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService* pService =
+    pServer->createService(SERVICE_UUID);
+
+  pCharacteristic =
+    pService->createCharacteristic(
+      CHARACTERISTIC_UUID,
+      BLECharacteristic::PROPERTY_READ |
+      BLECharacteristic::PROPERTY_NOTIFY
+    );
+
+  pCharacteristic->addDescriptor(new BLE2902());
+
+  pService->start();
+
+  BLEAdvertising* pAdvertising =
+    BLEDevice::getAdvertising();
+
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+
+  BLEDevice::startAdvertising();
+
+  Serial.println("[BLE] Advertising started");
+  Serial.println("Device: AGX-Node-1");
+
+  Serial.println("\n[MODE] Only JXBS 7-IN-1 enabled");
+  Serial.println("[MODE] SHT40 removed");
+  Serial.println("[MODE] Turbidity removed");
+  Serial.println("[MODE] TDS removed");
+
+  Serial.println("\n[SYSTEM] Ready");
+  Serial.println("========================================");
+}
+
+// =====================================================
+// LOOP - ORIGINAL 7-IN-1 READING + BLE
+// =====================================================
+
+void loop() {
+
+  // ---------- JXBS 7-IN-1 ----------
+
+  int16_t rawPH = readRegister(0x0006);
+  delay(100);
+
+  int16_t rawMoisture = readRegister(0x0012);
+  delay(100);
+
+  int16_t rawSoilTemp = readRegister(0x0013);
+  delay(100);
+
+  int16_t rawEC = readRegister(0x0015);
+  delay(100);
+
+  // ---------- NPK ----------
+
+  int N = 0;
+  int P = 0;
+  int K = 0;
+
+  bool npkOK = readNPK(N, P, K);
+
+  // ---------- SOIL VALUES ----------
+
+  float soilPH = -1;
+  float soilMoisture = -1;
+  float soilTemperature = -9999;
+  float soilEC = -1;
+
+  if (rawPH >= 0)
+    soilPH = rawPH / 100.0;
+
+  if (rawMoisture >= 0)
+    soilMoisture = rawMoisture / 10.0;
+
+  if (rawSoilTemp != -9999) {
+    soilTemperature =
+        (int16_t)rawSoilTemp / 10.0;
+  }
+
+  if (rawEC >= 0)
+    soilEC = rawEC;
+
+  // ---------- SERIAL OUTPUT ----------
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("          JXBS 7-IN-1 READINGS");
+  Serial.println("========================================");
+
+  if (soilPH >= 0)
+    Serial.printf("Soil pH          : %.2f\n", soilPH);
+  else
+    Serial.println("Soil pH          : ERROR");
+
+  if (soilMoisture >= 0)
+    Serial.printf("Soil Moisture    : %.1f %%\n", soilMoisture);
+  else
+    Serial.println("Soil Moisture    : ERROR");
+
+  if (soilTemperature != -9999)
+    Serial.printf("Soil Temperature : %.1f C\n", soilTemperature);
+  else
+    Serial.println("Soil Temperature : ERROR");
+
+  if (soilEC >= 0)
+    Serial.printf("Soil EC          : %.0f uS/cm\n", soilEC);
+  else
+    Serial.println("Soil EC          : ERROR");
+
+  if (npkOK) {
+    Serial.printf("Nitrogen (N)     : %d mg/kg\n", N);
+    Serial.printf("Phosphorus (P)   : %d mg/kg\n", P);
+    Serial.printf("Potassium (K)    : %d mg/kg\n", K);
+  } else {
+    Serial.println("Nitrogen (N)     : ERROR");
+    Serial.println("Phosphorus (P)   : ERROR");
+    Serial.println("Potassium (K)    : ERROR");
+  }
+
+  Serial.println("========================================");
+
+  // ---------- BLE ----------
+
+  if (deviceConnected) {
+
+    sendBLEData(
+      soilPH,
+      soilMoisture,
+      soilTemperature,
+      soilEC,
+      N,
+      P,
+      K,
+      npkOK
+    );
+
+  } else {
+
+    Serial.println("[BLE] Waiting for Android connection");
+  }
+
+  delay(5000);
+}

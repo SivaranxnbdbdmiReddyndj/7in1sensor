@@ -1,0 +1,1147 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_SHT4x.h>
+#include <math.h>
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+#include <ArduinoJson.h>
+
+
+// ============================================================
+// DEVICE
+// ============================================================
+
+#define DEVICE_NAME "AGX-Node-1"
+
+
+// ============================================================
+// BLE UUIDs
+// ============================================================
+
+#define AGX_SERVICE_UUID \
+"4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+
+#define AGX_CHARACTERISTIC_UUID \
+"beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+
+// ============================================================
+// BLE TIMING
+// ============================================================
+
+#define READING_INTERVAL_MS 5000
+
+
+// ============================================================
+// RS485 7-IN-1 SOIL SENSOR
+// ============================================================
+
+#define RS485_RX        16
+#define RS485_TX        17
+#define RS485_DE_RE      4
+
+
+// ============================================================
+// SHT40
+// ============================================================
+
+#define SHT40_SDA       21
+#define SHT40_SCL       22
+
+
+// ============================================================
+// WATER SENSORS
+// ============================================================
+
+#define TURBIDITY_PIN   34
+#define TDS_PIN         35
+
+
+// ============================================================
+// TDS CALIBRATION
+// ============================================================
+
+#define TDS_CAL_FACTOR  10.133042
+
+
+// ============================================================
+// TURBIDITY ROUGH CALIBRATION
+// ============================================================
+
+// Approximate calibration points:
+//
+// 0 NTU   = 2.1678 V
+// 100 NTU = 1.9929 V
+//
+// This is ONLY a rough prototype calibration.
+
+#define TURBIDITY_CLEAR_VOLTAGE   2.1678
+#define TURBIDITY_100NTU_VOLTAGE  1.9929
+
+
+// ============================================================
+// HARDWARE OBJECTS
+// ============================================================
+
+HardwareSerial RS485Serial(2);
+
+Adafruit_SHT4x sht40;
+
+
+// ============================================================
+// BLE OBJECTS
+// ============================================================
+
+BLEServer* pServer = nullptr;
+
+BLECharacteristic* pCharacteristic = nullptr;
+
+bool deviceConnected = false;
+
+unsigned long lastReadingTime = 0;
+
+
+// ============================================================
+// SENSOR VARIABLES
+// ============================================================
+
+// ---------------- SOIL 7-IN-1 ----------------
+
+float soilPH = 0;
+
+float soilMoisture = 0;
+
+float soilTemperature = 0;
+
+float soilEC = 0;
+
+float nitrogen = 0;
+
+float phosphorus = 0;
+
+float potassium = 0;
+
+
+// ---------------- SHT40 ----------------
+
+float airTemperature = 0;
+
+float airHumidity = 0;
+
+
+// ---------------- TURBIDITY ----------------
+
+int turbidityADC = 0;
+
+float turbidityVoltage = 0;
+
+float turbidityNTU = 0;
+
+
+// ---------------- TDS ----------------
+
+float tdsADC = 0;
+
+float tdsVoltage = 0;
+
+float tdsValue = 0;
+
+
+// ============================================================
+// BLE CALLBACKS
+// ============================================================
+
+class ServerCallbacks : public BLEServerCallbacks
+{
+  void onConnect(BLEServer* pServer) override
+  {
+    deviceConnected = true;
+
+    Serial.println();
+    Serial.println("[BLE] Mobile application connected.");
+  }
+
+
+  void onDisconnect(BLEServer* pServer) override
+  {
+    deviceConnected = false;
+
+    Serial.println();
+    Serial.println("[BLE] Mobile application disconnected.");
+
+    BLEDevice::startAdvertising();
+
+    Serial.println("[BLE] Advertising restarted.");
+  }
+};
+
+
+// ============================================================
+// MODBUS CRC16
+// ============================================================
+
+uint16_t modbusCRC(uint8_t *data, uint8_t length)
+{
+  uint16_t crc = 0xFFFF;
+
+  for (uint8_t i = 0; i < length; i++)
+  {
+    crc ^= data[i];
+
+    for (uint8_t j = 0; j < 8; j++)
+    {
+      if (crc & 0x0001)
+      {
+        crc >>= 1;
+        crc ^= 0xA001;
+      }
+      else
+      {
+        crc >>= 1;
+      }
+    }
+  }
+
+  return crc;
+}
+
+
+// ============================================================
+// READ ONE MODBUS REGISTER
+// ============================================================
+
+bool readRegister(uint16_t address, uint16_t &value)
+{
+  uint8_t request[8];
+
+  request[0] = 0x01;
+  request[1] = 0x03;
+
+  request[2] = highByte(address);
+  request[3] = lowByte(address);
+
+  request[4] = 0x00;
+  request[5] = 0x01;
+
+  uint16_t crc = modbusCRC(request, 6);
+
+  request[6] = lowByte(crc);
+  request[7] = highByte(crc);
+
+
+  // Clear old data
+
+  while (RS485Serial.available())
+  {
+    RS485Serial.read();
+  }
+
+
+  // ---------------- TRANSMIT ----------------
+
+  digitalWrite(RS485_DE_RE, HIGH);
+
+  delayMicroseconds(200);
+
+  RS485Serial.write(request, 8);
+
+  RS485Serial.flush();
+
+  delayMicroseconds(200);
+
+
+  // ---------------- RECEIVE ----------------
+
+  digitalWrite(RS485_DE_RE, LOW);
+
+
+  uint8_t response[32];
+
+  uint8_t length = 0;
+
+  unsigned long startTime = millis();
+
+
+  while (millis() - startTime < 1000)
+  {
+    while (RS485Serial.available())
+    {
+      if (length < sizeof(response))
+      {
+        response[length++] = RS485Serial.read();
+      }
+    }
+  }
+
+
+  if (length < 7)
+  {
+    return false;
+  }
+
+
+  if (response[0] != 0x01)
+  {
+    return false;
+  }
+
+
+  if (response[1] & 0x80)
+  {
+    return false;
+  }
+
+
+  if (response[1] != 0x03)
+  {
+    return false;
+  }
+
+
+  if (response[2] != 0x02)
+  {
+    return false;
+  }
+
+
+  uint16_t receivedCRC =
+    response[length - 2] |
+    (response[length - 1] << 8);
+
+
+  uint16_t calculatedCRC =
+    modbusCRC(response, length - 2);
+
+
+  if (receivedCRC != calculatedCRC)
+  {
+    Serial.println("[RS485] CRC ERROR");
+    return false;
+  }
+
+
+  value =
+    ((uint16_t)response[3] << 8) |
+    response[4];
+
+
+  return true;
+}
+
+
+// ============================================================
+// READ 7-IN-1 SENSOR
+// ============================================================
+
+void read7in1()
+{
+  uint16_t raw;
+
+
+  // ---------------- SOIL pH ----------------
+
+  if (readRegister(0x0006, raw))
+  {
+    soilPH = raw / 100.0;
+  }
+
+  delay(100);
+
+
+  // ---------------- MOISTURE ----------------
+
+  if (readRegister(0x0012, raw))
+  {
+    soilMoisture = raw / 10.0;
+  }
+
+  delay(100);
+
+
+  // ---------------- SOIL TEMPERATURE ----------------
+
+  if (readRegister(0x0013, raw))
+  {
+    int16_t signedTemperature = (int16_t)raw;
+
+    soilTemperature =
+      signedTemperature / 10.0;
+  }
+
+  delay(100);
+
+
+  // ---------------- EC ----------------
+
+  if (readRegister(0x0015, raw))
+  {
+    soilEC = raw;
+  }
+
+  delay(100);
+
+
+  // ---------------- NITROGEN ----------------
+
+  if (readRegister(0x001E, raw))
+  {
+    nitrogen = raw;
+  }
+
+  delay(100);
+
+
+  // ---------------- PHOSPHORUS ----------------
+
+  if (readRegister(0x001F, raw))
+  {
+    phosphorus = raw;
+  }
+
+  delay(100);
+
+
+  // ---------------- POTASSIUM ----------------
+
+  if (readRegister(0x0020, raw))
+  {
+    potassium = raw;
+  }
+}
+
+
+// ============================================================
+// READ SHT40
+// ============================================================
+
+void readSHT40()
+{
+  sensors_event_t humidityEvent;
+
+  sensors_event_t temperatureEvent;
+
+
+  sht40.getEvent(
+    &humidityEvent,
+    &temperatureEvent
+  );
+
+
+  airTemperature =
+    temperatureEvent.temperature;
+
+
+  airHumidity =
+    humidityEvent.relative_humidity;
+}
+
+
+// ============================================================
+// READ TURBIDITY
+// ============================================================
+
+void readTurbidity()
+{
+  long total = 0;
+
+
+  // Take 20 samples
+
+  for (int i = 0; i < 20; i++)
+  {
+    total += analogRead(TURBIDITY_PIN);
+
+    delay(10);
+  }
+
+
+  turbidityADC =
+    total / 20;
+
+
+  // ESP32 ADC voltage
+
+  turbidityVoltage =
+    (turbidityADC / 4095.0) * 3.3;
+
+
+  // ----------------------------------------------------------
+  // ROUGH LINEAR NTU CALCULATION
+  // ----------------------------------------------------------
+
+  turbidityNTU =
+    (
+      (TURBIDITY_CLEAR_VOLTAGE - turbidityVoltage)
+      /
+      (TURBIDITY_CLEAR_VOLTAGE -
+       TURBIDITY_100NTU_VOLTAGE)
+    ) * 100.0;
+
+
+  // Prevent negative values
+
+  if (turbidityNTU < 0)
+  {
+    turbidityNTU = 0;
+  }
+
+
+  // Limit maximum displayed value
+
+  if (turbidityNTU > 1000)
+  {
+    turbidityNTU = 1000;
+  }
+}
+
+
+// ============================================================
+// READ TDS
+// ============================================================
+
+void readTDS()
+{
+  long total = 0;
+
+
+  // Take 20 samples
+
+  for (int i = 0; i < 20; i++)
+  {
+    total += analogRead(TDS_PIN);
+
+    delay(10);
+  }
+
+
+  int raw =
+    total / 20;
+
+
+  tdsADC = raw;
+
+
+  // ADC voltage
+
+  tdsVoltage =
+    (raw / 4095.0) * 3.3;
+
+
+  // ----------------------------------------------------------
+  // WATER TEMPERATURE
+  // ----------------------------------------------------------
+
+  // No water-temperature sensor currently available.
+  // Therefore using 25°C.
+
+  float waterTemperature = 25.0;
+
+
+  // ----------------------------------------------------------
+  // TEMPERATURE COMPENSATION
+  // ----------------------------------------------------------
+
+  float compensationCoefficient =
+    1.0 +
+    0.02 *
+    (waterTemperature - 25.0);
+
+
+  float compensationVoltage =
+    tdsVoltage /
+    compensationCoefficient;
+
+
+  // ----------------------------------------------------------
+  // DFRobot TDS FORMULA
+  // ----------------------------------------------------------
+
+  float calculatedTDS =
+    (
+      133.42 *
+      pow(compensationVoltage, 3)
+
+      -
+
+      255.86 *
+      pow(compensationVoltage, 2)
+
+      +
+
+      857.39 *
+      compensationVoltage
+    ) * 0.5;
+
+
+  if (calculatedTDS < 0)
+  {
+    calculatedTDS = 0;
+  }
+
+
+  // ----------------------------------------------------------
+  // YOUR CALIBRATION
+  // ----------------------------------------------------------
+
+  tdsValue =
+    calculatedTDS *
+    TDS_CAL_FACTOR;
+}
+
+
+// ============================================================
+// PRINT SENSOR DATA
+// ============================================================
+
+void printSensorData()
+{
+  Serial.println();
+
+  Serial.println("==========================================");
+
+  Serial.println("             SENSOR DATA");
+
+  Serial.println("==========================================");
+
+
+  // ==========================================================
+  // SOIL
+  // ==========================================================
+
+  Serial.println();
+
+  Serial.println("----- SOIL 7-IN-1 -----");
+
+
+  Serial.printf(
+    "Soil pH          : %.2f\n",
+    soilPH
+  );
+
+
+  Serial.printf(
+    "Soil Moisture    : %.1f %%\n",
+    soilMoisture
+  );
+
+
+  Serial.printf(
+    "Soil Temperature : %.1f °C\n",
+    soilTemperature
+  );
+
+
+  Serial.printf(
+    "Soil EC          : %.0f uS/cm\n",
+    soilEC
+  );
+
+
+  Serial.printf(
+    "Nitrogen         : %.0f mg/kg\n",
+    nitrogen
+  );
+
+
+  Serial.printf(
+    "Phosphorus       : %.0f mg/kg\n",
+    phosphorus
+  );
+
+
+  Serial.printf(
+    "Potassium        : %.0f mg/kg\n",
+    potassium
+  );
+
+
+  // ==========================================================
+  // AIR
+  // ==========================================================
+
+  Serial.println();
+
+  Serial.println("----- SHT40 -----");
+
+
+  Serial.printf(
+    "Air Temperature  : %.2f °C\n",
+    airTemperature
+  );
+
+
+  Serial.printf(
+    "Air Humidity     : %.2f %%\n",
+    airHumidity
+  );
+
+
+  // ==========================================================
+  // WATER
+  // ==========================================================
+
+  Serial.println();
+
+  Serial.println("----- WATER -----");
+
+
+  // Currently using soil pH as water_ph
+  // because there is no separate water pH sensor.
+
+  Serial.printf(
+    "Water pH         : %.2f (same sensor as soil pH)\n",
+    soilPH
+  );
+
+
+  Serial.printf(
+    "Turbidity ADC    : %d\n",
+    turbidityADC
+  );
+
+
+  Serial.printf(
+    "Turbidity Voltage: %.3f V\n",
+    turbidityVoltage
+  );
+
+
+  Serial.printf(
+    "Turbidity NTU    : %.1f NTU\n",
+    turbidityNTU
+  );
+
+
+  Serial.printf(
+    "TDS ADC          : %.0f\n",
+    tdsADC
+  );
+
+
+  Serial.printf(
+    "TDS Voltage      : %.3f V\n",
+    tdsVoltage
+  );
+
+
+  Serial.printf(
+    "TDS              : %.2f ppm\n",
+    tdsValue
+  );
+
+
+  Serial.println(
+    "TDS Temp Comp.   : 25.0 °C"
+  );
+
+
+  Serial.println();
+
+  Serial.println("==========================================");
+}
+
+
+// ============================================================
+// SEND JSON TO ANDROID APP
+// ============================================================
+
+void sendBLEData()
+{
+  // Bigger document for all fields
+
+  StaticJsonDocument<1024> doc;
+
+
+  // ==========================================================
+  // SOIL
+  // ==========================================================
+
+  doc["soil_ph"] =
+    soilPH;
+
+  doc["soil_moisture"] =
+    soilMoisture;
+
+  doc["soil_temp"] =
+    soilTemperature;
+
+  doc["soil_ec"] =
+    soilEC;
+
+  doc["nitrogen"] =
+    nitrogen;
+
+  doc["phosphorus"] =
+    phosphorus;
+
+  doc["potassium"] =
+    potassium;
+
+
+  // ==========================================================
+  // AIR
+  // ==========================================================
+
+  doc["air_temp"] =
+    airTemperature;
+
+  doc["humidity"] =
+    airHumidity;
+
+
+  // ==========================================================
+  // WATER pH
+  // ==========================================================
+
+  // IMPORTANT:
+  // There is currently no separate water-pH probe.
+  // This field is provided for Android app compatibility.
+
+  doc["water_ph"] =
+    soilPH;
+
+
+  // ==========================================================
+  // TURBIDITY
+  // ==========================================================
+
+  doc["turbidity"] =
+    turbidityNTU;
+
+  doc["turbidity_ntu"] =
+    turbidityNTU;
+
+  doc["turbidity_voltage"] =
+    turbidityVoltage;
+
+  doc["turbidity_adc"] =
+    turbidityADC;
+
+  doc["turbidity_status"] =
+    "Rough calibration";
+
+
+  // ==========================================================
+  // TDS
+  // ==========================================================
+
+  doc["tds"] =
+    tdsValue;
+
+  doc["tds_adc"] =
+    tdsADC;
+
+  doc["tds_voltage"] =
+    tdsVoltage;
+
+  doc["tds_temperature_comp"] =
+    25.0;
+
+
+  // ==========================================================
+  // DEVICE
+  // ==========================================================
+
+  doc["device"] =
+    DEVICE_NAME;
+
+
+  // ==========================================================
+  // SERIALIZE JSON
+  // ==========================================================
+
+  char jsonBuffer[1024];
+
+
+  size_t length =
+    serializeJson(
+      doc,
+      jsonBuffer,
+      sizeof(jsonBuffer)
+    );
+
+
+  // ==========================================================
+  // SEND BLE
+  // ==========================================================
+
+  pCharacteristic->setValue(
+    (uint8_t*)jsonBuffer,
+    length
+  );
+
+
+  pCharacteristic->notify();
+
+
+  // ==========================================================
+  // SERIAL OUTPUT
+  // ==========================================================
+
+  Serial.println();
+
+  Serial.println("[BLE] JSON SENT:");
+
+  Serial.println(jsonBuffer);
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(2000);
+
+
+  Serial.println();
+
+  Serial.println("==========================================");
+
+  Serial.println("      AGX AGRILYTHOS SENSOR NODE");
+
+  Serial.println("==========================================");
+
+
+  // ==========================================================
+  // RS485
+  // ==========================================================
+
+  pinMode(
+    RS485_DE_RE,
+    OUTPUT
+  );
+
+
+  digitalWrite(
+    RS485_DE_RE,
+    LOW
+  );
+
+
+  RS485Serial.begin(
+    9600,
+    SERIAL_8N1,
+    RS485_RX,
+    RS485_TX
+  );
+
+
+  Serial.println(
+    "[RS485] Started 9600 8N1"
+  );
+
+
+  // ==========================================================
+  // I2C
+  // ==========================================================
+
+  Wire.begin(
+    SHT40_SDA,
+    SHT40_SCL
+  );
+
+
+  // ==========================================================
+  // SHT40
+  // ==========================================================
+
+  if (sht40.begin())
+  {
+    Serial.println(
+      "[SHT40] Sensor detected."
+    );
+
+
+    sht40.setPrecision(
+      SHT4X_HIGH_PRECISION
+    );
+
+
+    sht40.setHeater(
+      SHT4X_NO_HEATER
+    );
+  }
+  else
+  {
+    Serial.println(
+      "[SHT40] NOT DETECTED!"
+    );
+  }
+
+
+  // ==========================================================
+  // ADC
+  // ==========================================================
+
+  analogReadResolution(12);
+
+
+  analogSetPinAttenuation(
+    TURBIDITY_PIN,
+    ADC_11db
+  );
+
+
+  analogSetPinAttenuation(
+    TDS_PIN,
+    ADC_11db
+  );
+
+
+  // ==========================================================
+  // BLE
+  // ==========================================================
+
+  Serial.println(
+    "[BLE] Starting BLE..."
+  );
+
+
+  BLEDevice::init(
+    DEVICE_NAME
+  );
+
+
+  BLEDevice::setMTU(512);
+
+
+  pServer =
+    BLEDevice::createServer();
+
+
+  pServer->setCallbacks(
+    new ServerCallbacks()
+  );
+
+
+  BLEService* pService =
+    pServer->createService(
+      AGX_SERVICE_UUID
+    );
+
+
+  pCharacteristic =
+    pService->createCharacteristic(
+
+      AGX_CHARACTERISTIC_UUID,
+
+      BLECharacteristic::PROPERTY_READ |
+      BLECharacteristic::PROPERTY_NOTIFY
+    );
+
+
+  pCharacteristic->addDescriptor(
+    new BLE2902()
+  );
+
+
+  pService->start();
+
+
+  BLEAdvertising* pAdvertising =
+    BLEDevice::getAdvertising();
+
+
+  pAdvertising->addServiceUUID(
+    AGX_SERVICE_UUID
+  );
+
+
+  pAdvertising->setScanResponse(
+    true
+  );
+
+
+  pAdvertising->setMinPreferred(
+    0x06
+  );
+
+
+  BLEDevice::startAdvertising();
+
+
+  Serial.println();
+
+  Serial.println("==========================================");
+
+  Serial.printf(
+    "[BLE] Advertising: %s\n",
+    DEVICE_NAME
+  );
+
+  Serial.println(
+    "[BLE] Waiting for mobile app..."
+  );
+
+  Serial.println("==========================================");
+}
+
+
+// ============================================================
+// LOOP
+// ============================================================
+
+void loop()
+{
+  if (!deviceConnected)
+  {
+    delay(100);
+
+    return;
+  }
+
+
+  unsigned long now =
+    millis();
+
+
+  if (
+    now - lastReadingTime
+    <
+    READING_INTERVAL_MS
+  )
+  {
+    delay(10);
+
+    return;
+  }
+
+
+  lastReadingTime =
+    now;
+
+
+  // ==========================================================
+  // READ ALL SENSORS
+  // ==========================================================
+
+  read7in1();
+
+  readSHT40();
+
+  readTurbidity();
+
+  readTDS();
+
+
+  // ==========================================================
+  // SERIAL
+  // ==========================================================
+
+  printSensorData();
+
+
+  // ==========================================================
+  // BLE
+  // ==========================================================
+
+  sendBLEData();
+}

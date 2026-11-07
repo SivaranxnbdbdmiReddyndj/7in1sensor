@@ -1,827 +1,434 @@
 
-/*
-=====================================================
-SMART BABY MONITORING SYSTEM
-BABY UNIT (ESP32)
-ESP-NOW TRANSMITTER
-
-Sensors
-1. MAX4466
-2. BMP180
-3. HC-SR04
-
-Outputs
-1. LED
-2. Active Buzzer
-=====================================================
-*/
-
 #include <WiFi.h>
 #include <esp_now.h>
-#include <Wire.h>
-#include <Adafruit_BMP085.h>
+#include <esp_wifi.h>
+#include <esp_arduino_version.h>
+#include <DHT.h>
 
-Adafruit_BMP085 bmp;
+// ========================================
+// BABY MONITORING UNIT - ESP32 TRANSMITTER
+// ESP32 Arduino Core 3.3.11 compatible
+// ========================================
 
-//=====================================================
-// PARENT ESP32 MAC ADDRESS
-// Replace with your Parent ESP32 MAC
-//=====================================================
+// SENSOR PINS
+#define MIC_AO       34
+#define MIC_DO       27
 
-uint8_t parentMAC[] =
-{
-  0x4C, 0xC3, 0x82, 0xCD, 0x88, 0x60
+#define DHT_PIN      17
+#define DHT_TYPE     DHT11
+
+#define TRIG_PIN     5
+#define ECHO_PIN     18
+
+// SETTINGS
+#define BABY_DISTANCE_LIMIT 80.0
+#define CRY_THRESHOLD       100
+#define QUIET_THRESHOLD     70
+
+#define ESPNOW_CHANNEL 1
+#define PACKET_MAGIC   0xBABE2026
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// ========================================
+// ESP-NOW PACKET
+// Must exactly match Parent Unit
+// ========================================
+
+typedef struct __attribute__((packed)) {
+
+  uint32_t magic;
+  uint32_t sequence;
+
+  float distanceCm;
+  float temperature;
+  float humidity;
+
+  uint16_t soundPeakToPeak;
+
+  uint8_t micDigital;
+  uint8_t babyPresent;
+  uint8_t presenceValid;
+  uint8_t crying;
+  uint8_t dhtValid;
+
+} BabyPacket;
+
+BabyPacket packet;
+
+// BROADCAST MAC ADDRESS
+uint8_t broadcastAddress[] = {
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
 };
 
-//=====================================================
-// DATA STRUCTURE
-// MUST BE IDENTICAL IN PARENT UNIT
-//=====================================================
+// ========================================
+// GLOBAL VARIABLES
+// ========================================
 
-typedef struct
-{
-  int soundLevel;
+uint32_t sequenceNumber = 0;
 
-  float temperature;
-  float pressure;
-  float distance;
+bool babyPresent = false;
+bool presenceValid = false;
+bool crying = false;
+bool dhtValid = false;
 
-  bool babyCry;
-  bool babyPresent;
+float currentDistance = -1.0;
+float temperature = NAN;
+float humidity = NAN;
 
-  bool roomHot;
-  bool roomCold;
+uint16_t soundPeakToPeak = 0;
 
-  int systemStatus;
+int presenceCount = 0;
+int absenceCount = 0;
 
-} BabyData;
+int cryCount = 0;
+int silenceCount = 0;
 
-BabyData data;
+unsigned long lastDHTRead = 0;
+unsigned long lastTransmit = 0;
 
-//=====================================================
-// PIN DEFINITIONS
-//=====================================================
+// ========================================
+// ULTRASONIC SENSOR
+// ========================================
 
-// MAX4466
-const int microphonePin = 34;
+float readDistance() {
 
-// HC-SR04
-const int trigPin = 5;
-const int echoPin = 18;
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
 
-// Outputs
-const int ledPin = 2;
-const int buzzerPin = 4;
-
-//=====================================================
-// SETTINGS
-//=====================================================
-
-// Adjust after testing
-const int SOUND_THRESHOLD = 3000;
-
-// Cry Detection
-const int SAMPLE_WINDOW = 50;      // milliseconds
-const int TOTAL_WINDOWS = 10;
-const int REQUIRED_LOUD = 3;
-
-// Temperature Limits
-const float LOW_TEMP = 22.0;
-const float HIGH_TEMP = 35.0;
-
-//=====================================================
-// VARIABLES
-//=====================================================
-
-bool babyCry = false;
-bool babyPresent = true;
-
-bool roomHot = false;
-bool roomCold = false;
-
-int sampleCounter = 0;
-int loudCounter = 0;
-
-//=====================================================
-// ESP-NOW CALLBACK
-//=====================================================
-
-void OnDataSent(const wifi_tx_info_t *info,
-                esp_now_send_status_t status)
-{
-  if (status == ESP_NOW_SEND_SUCCESS)
-  {
-    Serial.println("ESP-NOW : Data Sent");
-  }
-  else
-  {
-    Serial.println("ESP-NOW : Send Failed");
-  }
-}
-
-//=====================================================
-// SETUP
-//=====================================================
-
-void setup()
-{
-  Serial.begin(115200);
-
-  // ADC Configuration
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
-
-  // WiFi Station Mode
-  WiFi.mode(WIFI_STA);
-
-  Serial.println();
-  Serial.println("==================================");
-  Serial.println("SMART BABY MONITOR");
-  Serial.println("BABY UNIT");
-  Serial.println("==================================");
-
-  Serial.print("Baby MAC : ");
-  Serial.println(WiFi.macAddress());
-
-  //===================================================
-  // ESP-NOW
-  //===================================================
-
-  if (esp_now_init() != ESP_OK)
-  {
-    Serial.println("ESP-NOW Initialization Failed");
-
-    while (true);
-  }
-
-  esp_now_register_send_cb(OnDataSent);
-
-  esp_now_peer_info_t peerInfo = {};
-
-  memcpy(peerInfo.peer_addr, parentMAC, 6);
-
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-
-  if (esp_now_add_peer(&peerInfo) != ESP_OK)
-  {
-    Serial.println("Failed to Add Parent");
-
-    while (true);
-  }
-
-  //===================================================
-  // BMP180
-  //===================================================
-
-  Wire.begin(21, 22);
-
-  if (!bmp.begin())
-  {
-    Serial.println("BMP180 NOT FOUND");
-
-    while (true);
-  }
-
-  //===================================================
-  // PIN MODES
-  //===================================================
-
-  pinMode(microphonePin, INPUT);
-
-  pinMode(trigPin, OUTPUT);
-  pinMode(echoPin, INPUT);
-
-  pinMode(ledPin, OUTPUT);
-  pinMode(buzzerPin, OUTPUT);
-
-  digitalWrite(ledPin, LOW);
-  digitalWrite(buzzerPin, LOW);
-
-  Serial.println();
-  Serial.println("Baby Unit Ready");
-  Serial.println("==================================");
-}
-
-//=====================================================
-// LOOP
-//=====================================================
-
-void loop()
-{
-```
-
----
-
-✅ **Part 1 is complete.**
-
-The next part will start **inside the `loop()` function** and include:
-
-* MAX4466 sound acquisition
-* Baby cry detection (3 loud sounds in 10 windows)
-* BMP180 temperature/pressure reading
-* HC-SR04 baby presence detection
-
-After that, Part 3 will finish the sketch with ESP-NOW transmission, alerts, and the serial dashboard.
-Below is **Part 1** of the complete **Baby Unit**. Copy this into a new Arduino `.ino` file. **Do not add another `setup()` or `loop()`**—Parts 2 and 3 will continue from here.
-
-```cpp
-/*
-=====================================================
-SMART BABY MONITORING SYSTEM
-BABY UNIT (ESP32)
-ESP-NOW TRANSMITTER
-
-Sensors
-1. MAX4466
-2. BMP180
-3. HC-SR04
-
-Outputs
-1. LED
-2. Active Buzzer
-=====================================================
-*/
-
-#include <WiFi.h>
-#include <esp_now.h>
-#include <Wire.h>
-#include <Adafruit_BMP085.h>
-
-Adafruit_BMP085 bmp;
-
-//=====================================================
-// PARENT ESP32 MAC ADDRESS
-// Replace with your Parent ESP32 MAC
-//=====================================================
-
-uint8_t parentMAC[] =
-{
-  0x4C, 0xC3, 0x82, 0xCD, 0x88, 0x60
-};
-
-//=====================================================
-// DATA STRUCTURE
-// MUST BE IDENTICAL IN PARENT UNIT
-//=====================================================
-
-typedef struct
-{
-  int soundLevel;
-
-  float temperature;
-  float pressure;
-  float distance;
-
-  bool babyCry;
-  bool babyPresent;
-
-  bool roomHot;
-  bool roomCold;
-
-  int systemStatus;
-
-} BabyData;
-
-BabyData data;
-
-//=====================================================
-// PIN DEFINITIONS
-//=====================================================
-
-// MAX4466
-const int microphonePin = 34;
-
-// HC-SR04
-const int trigPin = 5;
-const int echoPin = 18;
-
-// Outputs
-const int ledPin = 2;
-const int buzzerPin = 4;
-
-//=====================================================
-// SETTINGS
-//=====================================================
-
-// Adjust after testing
-const int SOUND_THRESHOLD = 3000;
-
-// Cry Detection
-const int SAMPLE_WINDOW = 50;      // milliseconds
-const int TOTAL_WINDOWS = 10;
-const int REQUIRED_LOUD = 3;
-
-// Temperature Limits
-const float LOW_TEMP = 22.0;
-const float HIGH_TEMP = 35.0;
-
-//=====================================================
-// VARIABLES
-//=====================================================
-
-bool babyCry = false;
-bool babyPresent = true;
-
-bool roomHot = false;
-bool roomCold = false;
-
-int sampleCounter = 0;
-int loudCounter = 0;
-
-//=====================================================
-// ESP-NOW CALLBACK
-//=====================================================
-
-void OnDataSent(const wifi_tx_info_t *info,
-                esp_now_send_status_t status)
-{
-  if (status == ESP_NOW_SEND_SUCCESS)
-  {
-    Serial.println("ESP-NOW : Data Sent");
-  }
-  else
-  {
-    Serial.println("ESP-NOW : Send Failed");
-  }
-}
-
-//=====================================================
-// SETUP
-//=====================================================
-
-void setup()
-{
-  Serial.begin(115200);
-
-  // ADC Configuration
-  analogReadResolution(12);
-  analogSetAttenuation(ADC_11db);
-
-  // WiFi Station Mode
-  WiFi.mode(WIFI_STA);
-
-  Serial.println();
-  Serial.println("==================================");
-  Serial.println("SMART BABY MONITOR");
-  Serial.println("BABY UNIT");
-  Serial.println("==================================");
-
-  Serial.print("Baby MAC : ");
-  Serial.println(WiFi.macAddress());
-
-  //===================================================
-  // ESP-NOW
-  //===================================================
-
-  if (esp_now_init() != ESP_OK)
-  {
-    Serial.println("ESP-NOW Initialization Failed");
-
-    while (true);
-  }
-
-  esp_now_register_send_cb(OnDataSent);
-
-  esp_now_peer_info_t peerInfo = {};
-
-  memcpy(peerInfo.peer_addr, parentMAC, 6);
-
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-
-  if (esp_now_add_peer(&peerInfo) != ESP_OK)
-  {
-    Serial.println("Failed to Add Parent");
-
-    while (true);
-  }
-
-  //===================================================
-  // BMP180
-  //===================================================
-
-  Wire.begin(21, 22);
-
-  if (!bmp.begin())
-  {
-    Serial.println("BMP180 NOT FOUND");
-
-    while (true);
-  }
-
-  //===================================================
-  // PIN MODES
-  //===================================================
-
-  pinMode(microphonePin, INPUT);
-
-  pinMode(trigPin, OUTPUT);
-  pinMode(echoPin, INPUT);
-
-  pinMode(ledPin, OUTPUT);
-  pinMode(buzzerPin, OUTPUT);
-
-  digitalWrite(ledPin, LOW);
-  digitalWrite(buzzerPin, LOW);
-
-  Serial.println();
-  Serial.println("Baby Unit Ready");
-  Serial.println("==================================");
-}
-
-//=====================================================
-// LOOP
-//=====================================================
-
-void loop()
-{
-
-
-
-  int signalMax = 0;
-  int signalMin = 4095;
-
-  unsigned long startMillis = millis();
-
-  while (millis() - startMillis < SAMPLE_WINDOW)
-  {
-    int sample = analogRead(microphonePin);
-
-    if (sample > signalMax)
-      signalMax = sample;
-
-    if (sample < signalMin)
-      signalMin = sample;
-  }
-
-  int soundLevel = signalMax - signalMin;
-
-  //=====================================================
-  // BABY CRY DETECTION
-  // 3 Loud Sounds in 10 Measurement Windows
-  //=====================================================
-
-  sampleCounter++;
-
-  if (soundLevel >= SOUND_THRESHOLD)
-  {
-    loudCounter++;
-  }
-
-  if (sampleCounter >= TOTAL_WINDOWS)
-  {
-    if (loudCounter >= REQUIRED_LOUD)
-    {
-      babyCry = true;
-    }
-    else
-    {
-      babyCry = false;
-    }
-
-    sampleCounter = 0;
-    loudCounter = 0;
-  }
-
-  //=====================================================
-  // BMP180
-  //=====================================================
-
-  float temperature = bmp.readTemperature();
-  float pressure = bmp.readPressure() / 100.0;
-
-  roomHot = false;
-  roomCold = false;
-
-  if (temperature > HIGH_TEMP)
-    roomHot = true;
-
-  if (temperature < LOW_TEMP)
-    roomCold = true;
-
-  //=====================================================
-  // HC-SR04
-  //=====================================================
-
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-
-  digitalWrite(trigPin, HIGH);
+  digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
 
-  digitalWrite(trigPin, LOW);
+  digitalWrite(TRIG_PIN, LOW);
 
-  long duration = pulseIn(echoPin, HIGH, 30000);
+  unsigned long duration =
+    pulseIn(ECHO_PIN, HIGH, 25000);
 
-  float distance;
-
-  if (duration == 0)
-  {
-    distance = 999;
-  }
-  else
-  {
-    distance = duration * 0.0343 / 2.0;
+  if (duration == 0) {
+    return -1.0;
   }
 
-  // Baby is considered present within 40 cm
+  float distance = duration * 0.0343 / 2.0;
 
-  if (distance <= 40)
-  {
-    babyPresent = true;
-  }
-  else
-  {
-    babyPresent = false;
+  if (distance < 2.0 || distance > 400.0) {
+    return -1.0;
   }
 
-  //=====================================================
-  // FILL DATA STRUCTURE
-  //=====================================================
+  return distance;
+}
 
-  data.soundLevel = soundLevel;
+// ========================================
+// BABY PRESENCE DETECTION
+// ========================================
 
-  data.temperature = temperature;
-  data.pressure = pressure;
-  data.distance = distance;
+void updatePresence() {
 
-  data.babyCry = babyCry;
-  data.babyPresent = babyPresent;
+  currentDistance = readDistance();
 
-  data.roomHot = roomHot;
-  data.roomCold = roomCold;
+  if (currentDistance < 0) {
 
-  //=====================================================
-  // SYSTEM STATUS
-  //
-  // 0 = SAFE
-  // 1 = BABY CRYING
-  // 2 = BABY NOT PRESENT
-  //=====================================================
+    presenceValid = false;
 
-  if (!babyPresent)
-  {
-    data.systemStatus = 2;
-  }
-  else if (babyCry)
-  {
-    data.systemStatus = 1;
-  }
-  else
-  {
-    data.systemStatus = 0;
-  }
-Great. Continue **inside the `loop()` function** from the end of Part 1.
+    // Invalid distance is a sensor error.
+    // Do not automatically declare baby missing.
 
-## **PART 2 – Sensor Reading & Detection**
-
-```cpp
-  //=====================================================
-  // MAX4466 SOUND LEVEL MEASUREMENT
-  //=====================================================
-
-  int signalMax = 0;
-  int signalMin = 4095;
-
-  unsigned long startMillis = millis();
-
-  while (millis() - startMillis < SAMPLE_WINDOW)
-  {
-    int sample = analogRead(microphonePin);
-
-    if (sample > signalMax)
-      signalMax = sample;
-
-    if (sample < signalMin)
-      signalMin = sample;
+    return;
   }
 
-  int soundLevel = signalMax - signalMin;
+  presenceValid = true;
 
-  //=====================================================
-  // BABY CRY DETECTION
-  // 3 Loud Sounds in 10 Measurement Windows
-  //=====================================================
+  if (currentDistance < BABY_DISTANCE_LIMIT) {
 
-  sampleCounter++;
+    presenceCount++;
+    absenceCount = 0;
 
-  if (soundLevel >= SOUND_THRESHOLD)
-  {
-    loudCounter++;
-  }
-
-  if (sampleCounter >= TOTAL_WINDOWS)
-  {
-    if (loudCounter >= REQUIRED_LOUD)
-    {
-      babyCry = true;
-    }
-    else
-    {
-      babyCry = false;
+    if (presenceCount >= 3) {
+      babyPresent = true;
     }
 
-    sampleCounter = 0;
-    loudCounter = 0;
+  } else {
+
+    absenceCount++;
+    presenceCount = 0;
+
+    if (absenceCount >= 3) {
+      babyPresent = false;
+    }
+  }
+}
+
+// ========================================
+// MICROPHONE ANALOG READING
+// ========================================
+
+uint16_t readSoundLevel() {
+
+  int minimumValue = 4095;
+  int maximumValue = 0;
+
+  for (int i = 0; i < 100; i++) {
+
+    int value = analogRead(MIC_AO);
+
+    if (value < minimumValue) {
+      minimumValue = value;
+    }
+
+    if (value > maximumValue) {
+      maximumValue = value;
+    }
+
+    delayMicroseconds(500);
   }
 
-  //=====================================================
-  // BMP180
-  //=====================================================
+  return maximumValue - minimumValue;
+}
 
-  float temperature = bmp.readTemperature();
-  float pressure = bmp.readPressure() / 100.0;
+// ========================================
+// CRYING DETECTION
+// ========================================
 
-  roomHot = false;
-  roomCold = false;
+void updateCrying() {
 
-  if (temperature > HIGH_TEMP)
-    roomHot = true;
+  soundPeakToPeak = readSoundLevel();
 
-  if (temperature < LOW_TEMP)
-    roomCold = true;
+  if (soundPeakToPeak >= CRY_THRESHOLD) {
 
-  //=====================================================
-  // HC-SR04
-  //=====================================================
+    cryCount++;
+    silenceCount = 0;
 
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
+    if (cryCount >= 2) {
+      crying = true;
+    }
 
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
+  } else if (soundPeakToPeak < QUIET_THRESHOLD) {
 
-  digitalWrite(trigPin, LOW);
+    silenceCount++;
+    cryCount = 0;
 
-  long duration = pulseIn(echoPin, HIGH, 30000);
+    if (silenceCount >= 3) {
+      crying = false;
+    }
 
-  float distance;
+  } else {
 
-  if (duration == 0)
-  {
-    distance = 999;
+    cryCount = 0;
+    silenceCount = 0;
   }
-  else
-  {
-    distance = duration * 0.0343 / 2.0;
+}
+
+// ========================================
+// DHT11 SENSOR
+// ========================================
+
+void readDHT() {
+
+  if (millis() - lastDHTRead >= 2000) {
+
+    lastDHTRead = millis();
+
+    float newTemperature = dht.readTemperature();
+    float newHumidity = dht.readHumidity();
+
+    if (!isnan(newTemperature) &&
+        !isnan(newHumidity)) {
+
+      temperature = newTemperature;
+      humidity = newHumidity;
+
+      dhtValid = true;
+
+    } else {
+
+      dhtValid = false;
+    }
   }
+}
 
-  // Baby is considered present within 40 cm
+// ========================================
+// ESP-NOW SEND CALLBACK
+// CORE 2.X AND 3.X COMPATIBLE
+// ========================================
 
-  if (distance <= 40)
-  {
-    babyPresent = true;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+
+void onDataSent(
+  const wifi_tx_info_t *tx_info,
+  esp_now_send_status_t status
+) {
+
+#else
+
+void onDataSent(
+  const uint8_t *mac_addr,
+  esp_now_send_status_t status
+) {
+
+#endif
+
+  Serial.print("ESP-NOW Send Status: ");
+
+  if (status == ESP_NOW_SEND_SUCCESS) {
+    Serial.println("SUCCESS");
+  } else {
+    Serial.println("FAILED");
   }
-  else
-  {
-    babyPresent = false;
-  }
+}
 
-  //=====================================================
-  // FILL DATA STRUCTURE
-  //=====================================================
+// ========================================
+// TRANSMIT DATA
+// ========================================
 
-  data.soundLevel = soundLevel;
+void transmitData() {
 
-  data.temperature = temperature;
-  data.pressure = pressure;
-  data.distance = distance;
+  packet.magic = PACKET_MAGIC;
+  packet.sequence = ++sequenceNumber;
 
-  data.babyCry = babyCry;
-  data.babyPresent = babyPresent;
+  packet.distanceCm = currentDistance;
+  packet.temperature = temperature;
+  packet.humidity = humidity;
 
-  data.roomHot = roomHot;
-  data.roomCold = roomCold;
+  packet.soundPeakToPeak = soundPeakToPeak;
 
-  //=====================================================
-  // SYSTEM STATUS
-  //
-  // 0 = SAFE
-  // 1 = BABY CRYING
-  // 2 = BABY NOT PRESENT
-  //=====================================================
+  packet.micDigital = digitalRead(MIC_DO);
 
-  if (!babyPresent)
-  {
-    data.systemStatus = 2;
-  }
-  else if (babyCry)
-  {
-    data.systemStatus = 1;
-  }
-  else
-  {
-    data.systemStatus = 0;
-  }
+  packet.babyPresent = babyPresent;
+  packet.presenceValid = presenceValid;
 
-  //=====================================================
-  // LOCAL ALERTS
-  //=====================================================
-
-  digitalWrite(ledPin, LOW);
-  digitalWrite(buzzerPin, LOW);
-
-  if (data.systemStatus == 2)
-  {
-    // Baby Not Present
-    digitalWrite(ledPin, HIGH);
-    digitalWrite(buzzerPin, HIGH);
-  }
-  else if (data.systemStatus == 1)
-  {
-    // Baby Crying
-    digitalWrite(ledPin, HIGH);
-
-    digitalWrite(buzzerPin, HIGH);
-    delay(200);
-    digitalWrite(buzzerPin, LOW);
-    delay(200);
-
-    digitalWrite(buzzerPin, HIGH);
-    delay(200);
-    digitalWrite(buzzerPin, LOW);
-  }
-  else if (roomHot || roomCold)
-  {
-    // Temperature Alert
-    digitalWrite(ledPin, HIGH);
-
-    digitalWrite(buzzerPin, HIGH);
-    delay(300);
-    digitalWrite(buzzerPin, LOW);
-  }
-
-  //=====================================================
-  // SEND DATA TO PARENT
-  //=====================================================
+  packet.crying = crying;
+  packet.dhtValid = dhtValid;
 
   esp_err_t result = esp_now_send(
-      parentMAC,
-      (uint8_t *)&data,
-      sizeof(data));
+    broadcastAddress,
+    (uint8_t *)&packet,
+    sizeof(packet)
+  );
 
-  if (result != ESP_OK)
-  {
-    Serial.println("ESP-NOW Send Failed");
-  }
+  // SERIAL DEBUGGING
 
-  //=====================================================
-  // SERIAL MONITOR
-  //=====================================================
+  Serial.println("\n========== BABY UNIT ==========");
 
-  Serial.println();
-  Serial.println("========================================");
-  Serial.println(" SMART BABY MONITORING SYSTEM ");
-  Serial.println("========================================");
+  Serial.print("Sequence: ");
+  Serial.println(sequenceNumber);
 
-  Serial.print("Sound Level : ");
-  Serial.println(soundLevel);
-
-  Serial.print("Temperature : ");
-  Serial.print(temperature);
-  Serial.println(" C");
-
-  Serial.print("Pressure    : ");
-  Serial.print(pressure);
-  Serial.println(" hPa");
-
-  Serial.print("Distance    : ");
-  Serial.print(distance);
+  Serial.print("Distance: ");
+  Serial.print(currentDistance);
   Serial.println(" cm");
 
-  Serial.println("----------------------------------------");
-
-  Serial.print("Baby Cry    : ");
-  Serial.println(babyCry ? "YES" : "NO");
+  Serial.print("Presence Valid: ");
+  Serial.println(presenceValid ? "YES" : "NO");
 
   Serial.print("Baby Present: ");
   Serial.println(babyPresent ? "YES" : "NO");
 
-  Serial.print("Room Hot    : ");
-  Serial.println(roomHot ? "YES" : "NO");
+  Serial.print("Sound Peak-to-Peak: ");
+  Serial.println(soundPeakToPeak);
 
-  Serial.print("Room Cold   : ");
-  Serial.println(roomCold ? "YES" : "NO");
+  Serial.print("Microphone DO: ");
+  Serial.println(digitalRead(MIC_DO));
 
-  Serial.println("----------------------------------------");
+  Serial.print("Crying: ");
+  Serial.println(crying ? "YES" : "NO");
 
-  switch (data.systemStatus)
-  {
-    case 0:
-      Serial.println("SYSTEM STATUS : SAFE");
-      break;
+  Serial.print("Temperature: ");
+  Serial.println(temperature);
 
-    case 1:
-      Serial.println("SYSTEM STATUS : BABY CRYING");
-      break;
+  Serial.print("Humidity: ");
+  Serial.println(humidity);
 
-    case 2:
-      Serial.println("SYSTEM STATUS : BABY NOT PRESENT");
-      break;
+  Serial.print("Send Request: ");
+
+  Serial.println(
+    result == ESP_OK ? "ACCEPTED" : "ERROR"
+  );
+
+  Serial.println("===============================");
+}
+
+// ========================================
+// SETUP
+// ========================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  pinMode(MIC_DO, INPUT);
+
+  analogReadResolution(12);
+
+  dht.begin();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  esp_wifi_set_channel(
+    ESPNOW_CHANNEL,
+    WIFI_SECOND_CHAN_NONE
+  );
+
+  Serial.println("\nBABY UNIT STARTING");
+
+  Serial.print("Baby Unit MAC Address: ");
+  Serial.println(WiFi.macAddress());
+
+  // INITIALIZE ESP-NOW
+
+  if (esp_now_init() != ESP_OK) {
+
+    Serial.println("ESP-NOW INITIALIZATION FAILED");
+
+    return;
   }
 
-  Serial.println("========================================");
+  // REGISTER SEND CALLBACK
 
-  delay(1000);
+  esp_now_register_send_cb(onDataSent);
+
+  // ADD BROADCAST PEER
+
+  esp_now_peer_info_t peerInfo = {};
+
+  memcpy(
+    peerInfo.peer_addr,
+    broadcastAddress,
+    6
+  );
+
+  peerInfo.channel = ESPNOW_CHANNEL;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+
+    Serial.println("FAILED TO ADD ESP-NOW PEER");
+
+    return;
+  }
+
+  Serial.println("ESP-NOW INITIALIZED");
+  Serial.println("CHANNEL: 1");
+  Serial.println("BABY UNIT READY");
+}
+
+// ========================================
+// MAIN LOOP
+// ========================================
+
+void loop() {
+
+  updatePresence();
+
+  updateCrying();
+
+  readDHT();
+
+  if (millis() - lastTransmit >= 250) {
+
+    lastTransmit = millis();
+
+    transmitData();
+  }
 }

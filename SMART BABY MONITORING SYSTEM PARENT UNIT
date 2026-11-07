@@ -1,246 +1,584 @@
-/*
-=====================================================
-SMART BABY MONITORING SYSTEM
-PARENT UNIT
-ESP32 + ESP-NOW
-
-Outputs
-1. LED
-2. Active Buzzer
-3. Vibration Motor
-
-=====================================================
-*/
-
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_arduino_version.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-//=====================================================
-// DATA STRUCTURE
-// Must be IDENTICAL to Baby Unit
-//=====================================================
+// =================================================
+// PARENT BABY MONITORING UNIT
+// ESP32 + ESP-NOW + SSD1306 OLED
+// =================================================
 
-typedef struct
-{
-  int soundLevel;
+// ---------------- OLED ----------------
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_ADDRESS 0x3C
+#define OLED_RESET -1
+
+#define OLED_SDA 22
+#define OLED_SCL 21
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  OLED_RESET
+);
+
+bool oledOK = false;
+
+// ---------------- OUTPUT PINS ----------------
+#define RED_LED       25
+#define GREEN_LED     26
+#define BLUE_LED      27
+
+#define BUZZER_PIN    4
+#define MOTOR_PIN     5
+
+// ---------------- ESP-NOW ----------------
+#define ESPNOW_CHANNEL 1
+#define PACKET_MAGIC 0xBABE2026
+
+// Must exactly match Baby Unit packet
+typedef struct __attribute__((packed)) {
+  uint32_t magic;
+  uint32_t sequence;
+  float distanceCm;
   float temperature;
-  float pressure;
-  float distance;
+  float humidity;
+  uint16_t soundPeakToPeak;
+  uint8_t micDigital;
+  uint8_t babyPresent;
+  uint8_t presenceValid;
+  uint8_t crying;
+  uint8_t dhtValid;
+} BabyPacket;
 
-  bool babyCry;
-  bool babyPresent;
+BabyPacket receivedPacket = {};
+BabyPacket pendingPacket = {};
 
-  bool roomHot;
-  bool roomCold;
+volatile bool newPacketAvailable = false;
 
-  int systemStatus;
+unsigned long lastPacketTime = 0;
+unsigned long lastOutputUpdate = 0;
+unsigned long lastOLEDUpdate = 0;
 
-} BabyData;
+bool connected = false;
+bool packetReceivedOnce = false;
 
-BabyData data;
+portMUX_TYPE packetMux = portMUX_INITIALIZER_UNLOCKED;
 
-//=====================================================
-// OUTPUT PINS
-//=====================================================
+// ---------------- ALERT TYPES ----------------
+enum AlertType {
+  ALERT_NORMAL,
+  ALERT_CRYING,
+  ALERT_BABY_MISSING,
+  ALERT_TEMP_LOW,
+  ALERT_TEMP_HIGH,
+  ALERT_SENSOR_ERROR,
+  ALERT_CONNECTION_LOST
+};
 
-const int ledPin = 2;
-const int buzzerPin = 4;
-const int motorPin = 5;
+AlertType currentAlert = ALERT_CONNECTION_LOST;
 
-//=====================================================
-// COMMUNICATION TIMEOUT
-//=====================================================
+// =================================================
+// ESP-NOW RECEIVE CALLBACK
+// Supports Arduino ESP32 Core 2.x and 3.x
+// =================================================
 
-unsigned long lastPacket = 0;
-const unsigned long TIMEOUT = 5000;
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
 
-//=====================================================
-// RECEIVE CALLBACK
-//=====================================================
+void onDataReceived(
+  const esp_now_recv_info_t *info,
+  const uint8_t *incomingData,
+  int len
+) {
 
-void OnDataRecv(const esp_now_recv_info_t *info,
-                const uint8_t *incomingData,
-                int len)
-{
-  memcpy(&data, incomingData, sizeof(data));
+#else
 
-  lastPacket = millis();
+void onDataReceived(
+  const uint8_t *mac,
+  const uint8_t *incomingData,
+  int len
+) {
 
-  Serial.println();
-  Serial.println("=================================");
-  Serial.println(" SMART BABY MONITOR ");
-  Serial.println("=================================");
+#endif
 
-  Serial.print("Sound Level : ");
-  Serial.println(data.soundLevel);
-
-  Serial.print("Temperature : ");
-  Serial.print(data.temperature);
-  Serial.println(" C");
-
-  Serial.print("Pressure : ");
-  Serial.print(data.pressure);
-  Serial.println(" hPa");
-
-  Serial.print("Distance : ");
-  Serial.print(data.distance);
-  Serial.println(" cm");
-
-  Serial.println("--------------------------------");
-
-  Serial.print("Baby Present : ");
-  Serial.println(data.babyPresent);
-
-  Serial.print("Baby Cry : ");
-  Serial.println(data.babyCry);
-
-  Serial.print("Room Hot : ");
-  Serial.println(data.roomHot);
-
-  Serial.print("Room Cold : ");
-  Serial.println(data.roomCold);
-
-  Serial.print("System Status : ");
-  Serial.println(data.systemStatus);
-
-  Serial.println("--------------------------------");
-
-  digitalWrite(ledPin, LOW);
-  digitalWrite(buzzerPin, LOW);
-  digitalWrite(motorPin, LOW);
-
-  //==================================
-  // BABY NOT PRESENT
-  //==================================
-
-  if (data.systemStatus == 2)
-  {
-    Serial.println("BABY NOT PRESENT");
-
-    digitalWrite(ledPin, HIGH);
-    digitalWrite(motorPin, HIGH);
-    digitalWrite(buzzerPin, HIGH);
+  if (len != sizeof(BabyPacket)) {
+    Serial.println("ERROR: INVALID PACKET SIZE");
+    return;
   }
 
-  //==================================
-  // BABY CRYING
-  //==================================
+  BabyPacket tempPacket;
+  memcpy(&tempPacket, incomingData, sizeof(tempPacket));
 
-  else if (data.systemStatus == 1)
-  {
-    Serial.println("BABY CRY DETECTED");
-
-    digitalWrite(ledPin, HIGH);
-    digitalWrite(motorPin, HIGH);
-
-    digitalWrite(buzzerPin, HIGH);
-    delay(200);
-
-    digitalWrite(buzzerPin, LOW);
-    delay(200);
-
-    digitalWrite(buzzerPin, HIGH);
-    delay(200);
-
-    digitalWrite(buzzerPin, LOW);
+  if (tempPacket.magic != PACKET_MAGIC) {
+    Serial.println("ERROR: INVALID PACKET MAGIC");
+    return;
   }
 
-  //==================================
-  // TEMPERATURE ALERT
-  //==================================
+  portENTER_CRITICAL(&packetMux);
 
-  else if (data.roomHot || data.roomCold)
-  {
-    Serial.println("ROOM TEMPERATURE ALERT");
+  memcpy(&pendingPacket, &tempPacket, sizeof(BabyPacket));
+  newPacketAvailable = true;
 
-    digitalWrite(ledPin, HIGH);
-    digitalWrite(motorPin, HIGH);
-
-    digitalWrite(buzzerPin, HIGH);
-    delay(300);
-
-    digitalWrite(buzzerPin, LOW);
-  }
-
-  //==================================
-  // NORMAL
-  //==================================
-
-  else
-  {
-    Serial.println("BABY SAFE");
-
-    digitalWrite(ledPin, LOW);
-    digitalWrite(buzzerPin, LOW);
-    digitalWrite(motorPin, LOW);
-  }
-
-  Serial.println("=================================");
+  portEXIT_CRITICAL(&packetMux);
 }
-//=====================================================
+
+// =================================================
+// PROCESS RECEIVED PACKET
+// =================================================
+
+void processReceivedPacket() {
+
+  bool available = false;
+  BabyPacket tempPacket;
+
+  portENTER_CRITICAL(&packetMux);
+
+  if (newPacketAvailable) {
+    memcpy(&tempPacket, &pendingPacket, sizeof(BabyPacket));
+    newPacketAvailable = false;
+    available = true;
+  }
+
+  portEXIT_CRITICAL(&packetMux);
+
+  if (!available) return;
+
+  memcpy(&receivedPacket, &tempPacket, sizeof(BabyPacket));
+
+  lastPacketTime = millis();
+  connected = true;
+  packetReceivedOnce = true;
+
+  Serial.println("\n========== BABY DATA ==========");
+
+  Serial.print("Sequence: ");
+  Serial.println(receivedPacket.sequence);
+
+  Serial.print("Distance: ");
+  Serial.println(receivedPacket.distanceCm);
+
+  Serial.print("Baby Present: ");
+  Serial.println(receivedPacket.babyPresent ? "YES" : "NO");
+
+  Serial.print("Presence Valid: ");
+  Serial.println(receivedPacket.presenceValid);
+
+  Serial.print("Crying: ");
+  Serial.println(receivedPacket.crying ? "YES" : "NO");
+
+  Serial.print("Temperature: ");
+  Serial.println(receivedPacket.temperature);
+
+  Serial.print("Humidity: ");
+  Serial.println(receivedPacket.humidity);
+
+  Serial.print("Sound Level: ");
+  Serial.println(receivedPacket.soundPeakToPeak);
+
+  Serial.println("===============================");
+}
+
+// =================================================
+// IDENTIFY ALERT
+// =================================================
+
+AlertType identifyAlert() {
+
+  // 1. Communication failure
+  if (!connected) {
+    return ALERT_CONNECTION_LOST;
+  }
+
+  // 2. Crying alert
+  if (receivedPacket.crying) {
+    return ALERT_CRYING;
+  }
+
+  // 3. Baby missing
+  if (!receivedPacket.babyPresent) {
+    return ALERT_BABY_MISSING;
+  }
+
+  // 4. Temperature alerts
+  if (receivedPacket.dhtValid) {
+
+    if (receivedPacket.temperature < 25.0) {
+      return ALERT_TEMP_LOW;
+    }
+
+    if (receivedPacket.temperature > 31.0) {
+      return ALERT_TEMP_HIGH;
+    }
+  }
+
+  // 5. Sensor errors
+  if (!receivedPacket.presenceValid ||
+      !receivedPacket.dhtValid) {
+    return ALERT_SENSOR_ERROR;
+  }
+
+  return ALERT_NORMAL;
+}
+
+// =================================================
+// LED CONTROL
+// Common-cathode RGB LED, active HIGH
+// =================================================
+
+void setLED(bool red, bool green, bool blue) {
+
+  digitalWrite(RED_LED, red);
+  digitalWrite(GREEN_LED, green);
+  digitalWrite(BLUE_LED, blue);
+}
+
+// =================================================
+// ALERT OUTPUT CONTROL
+// =================================================
+
+void updateAlertOutputs() {
+
+  unsigned long now = millis();
+
+  bool buzzerState = false;
+  bool motorState = false;
+
+  switch (currentAlert) {
+
+    case ALERT_NORMAL:
+
+      setLED(false, true, false);
+
+      break;
+
+    case ALERT_CRYING:
+
+      setLED(true, false, false);
+
+      buzzerState = true;
+      motorState = true;
+
+      break;
+
+    case ALERT_BABY_MISSING:
+
+      setLED(true, false, false);
+
+      buzzerState = ((now / 300) % 2 == 0);
+      motorState = buzzerState;
+
+      break;
+
+    case ALERT_TEMP_LOW:
+    case ALERT_TEMP_HIGH:
+
+      setLED(false, false, true);
+
+      buzzerState = ((now % 1000) < 150);
+      motorState = buzzerState;
+
+      break;
+
+    case ALERT_SENSOR_ERROR:
+
+      setLED(false, false, true);
+
+      break;
+
+    case ALERT_CONNECTION_LOST:
+
+      setLED(true, false, false);
+
+      buzzerState = ((now % 1000) < 250);
+      motorState = buzzerState;
+
+      break;
+  }
+
+  digitalWrite(BUZZER_PIN, buzzerState);
+  digitalWrite(MOTOR_PIN, motorState);
+}
+
+// =================================================
+// ALERT TEXT
+// =================================================
+
+const char* getAlertText() {
+
+  switch (currentAlert) {
+
+    case ALERT_NORMAL:
+      return "NORMAL";
+
+    case ALERT_CRYING:
+      return "BABY CRYING";
+
+    case ALERT_BABY_MISSING:
+      return "BABY MISSING";
+
+    case ALERT_TEMP_LOW:
+      return "TEMP LOW";
+
+    case ALERT_TEMP_HIGH:
+      return "TEMP HIGH";
+
+    case ALERT_SENSOR_ERROR:
+      return "SENSOR ERROR";
+
+    case ALERT_CONNECTION_LOST:
+      return "CONNECTION LOST";
+  }
+
+  return "UNKNOWN";
+}
+
+// =================================================
+// OLED DISPLAY
+// =================================================
+
+void updateOLED() {
+
+  if (!oledOK) return;
+
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  // Title
+  display.setTextSize(1);
+  display.setCursor(17, 0);
+  display.println("BABY MONITOR SYSTEM");
+
+  display.drawLine(0, 10, 127, 10, SSD1306_WHITE);
+
+  // Connection
+  display.setCursor(0, 13);
+  display.print("Link: ");
+
+  if (connected) {
+    display.println("CONNECTED");
+  } else {
+    display.println("DISCONNECTED");
+  }
+
+  // Baby status
+  display.setCursor(0, 24);
+  display.print("Baby: ");
+
+  if (!connected) {
+    display.println("UNKNOWN");
+  }
+  else if (receivedPacket.babyPresent) {
+    display.println("PRESENT");
+  }
+  else {
+    display.println("MISSING");
+  }
+
+  // Cry status
+  display.setCursor(0, 34);
+  display.print("Cry: ");
+
+  if (connected && receivedPacket.crying) {
+    display.println("DETECTED");
+  } else {
+    display.println("NO");
+  }
+
+  // Temperature and humidity
+  display.setCursor(0, 44);
+
+  if (connected && receivedPacket.dhtValid) {
+
+    display.print("T:");
+    display.print(receivedPacket.temperature, 1);
+
+    display.print("C H:");
+    display.print(receivedPacket.humidity, 0);
+    display.print("%");
+
+  } else {
+
+    display.print("T:--.-C H:--%");
+
+  }
+
+  // Alert
+  display.drawLine(0, 54, 127, 54, SSD1306_WHITE);
+
+  display.setCursor(0, 56);
+  display.print("Alert: ");
+  display.print(getAlertText());
+
+  display.display();
+}
+
+// =================================================
 // SETUP
-//=====================================================
+// =================================================
 
-void setup()
-{
+void setup() {
+
   Serial.begin(115200);
+  delay(1000);
 
-  // Configure Output Pins
-  pinMode(ledPin, OUTPUT);
-  pinMode(buzzerPin, OUTPUT);
-  pinMode(motorPin, OUTPUT);
+  Serial.println("\n==============================");
+  Serial.println("PARENT UNIT STARTING");
+  Serial.println("==============================");
 
-  // Turn OFF all outputs initially
-  digitalWrite(ledPin, LOW);
-  digitalWrite(buzzerPin, LOW);
-  digitalWrite(motorPin, LOW);
+  // Output initialization
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
 
-  // Configure ESP32 as Station
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(MOTOR_PIN, OUTPUT);
+
+  setLED(false, false, false);
+
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(MOTOR_PIN, LOW);
+
+  // OLED initialization
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(100000);
+
+  if (display.begin(
+        SSD1306_SWITCHCAPVCC,
+        OLED_ADDRESS
+      )) {
+
+    oledOK = true;
+
+    Serial.println("OLED INITIALIZED");
+
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+
+    display.setCursor(20, 20);
+    display.println("PARENT UNIT");
+
+    display.setCursor(20, 35);
+    display.println("INITIALIZING...");
+
+    display.display();
+
+  } else {
+
+    Serial.println("OLED INITIALIZATION FAILED");
+
+  }
+
+  // Wi-Fi initialization
   WiFi.mode(WIFI_STA);
+  delay(500);
 
-  Serial.println();
-  Serial.println("=================================");
-  Serial.println("SMART BABY MONITOR");
-  Serial.println("PARENT UNIT");
-  Serial.println("=================================");
+  WiFi.disconnect();
 
-  Serial.print("Parent MAC Address : ");
+  Serial.print("Parent MAC: ");
   Serial.println(WiFi.macAddress());
 
-  // Initialize ESP-NOW
-  if (esp_now_init() != ESP_OK)
-  {
-    Serial.println("ESP-NOW Initialization Failed!");
-    while (true);
+  // Set ESP-NOW channel
+  esp_err_t channelResult =
+    esp_wifi_set_channel(
+      ESPNOW_CHANNEL,
+      WIFI_SECOND_CHAN_NONE
+    );
+
+  if (channelResult != ESP_OK) {
+    Serial.print("CHANNEL ERROR: ");
+    Serial.println(esp_err_to_name(channelResult));
   }
 
-  // Register Receive Callback
-  esp_now_register_recv_cb(OnDataRecv);
+  Serial.print("WiFi Channel: ");
+  Serial.println(ESPNOW_CHANNEL);
 
-  Serial.println();
-  Serial.println("ESP-NOW Ready");
-  Serial.println("Waiting for Baby Unit...");
-  Serial.println("=================================");
+  // ESP-NOW initialization
+  if (esp_now_init() != ESP_OK) {
+
+    Serial.println("ESP-NOW INITIALIZATION FAILED");
+
+    if (oledOK) {
+      display.clearDisplay();
+      display.setCursor(0, 20);
+      display.println("ESP-NOW FAILED");
+      display.display();
+    }
+
+    while (true) {
+      digitalWrite(RED_LED, !digitalRead(RED_LED));
+      delay(500);
+    }
+  }
+
+  Serial.println("ESP-NOW INITIALIZED");
+
+  // Register receive callback
+  esp_err_t callbackResult =
+    esp_now_register_recv_cb(onDataReceived);
+
+  if (callbackResult != ESP_OK) {
+    Serial.println("RECEIVE CALLBACK REGISTRATION FAILED");
+  } else {
+    Serial.println("RECEIVE CALLBACK REGISTERED");
+  }
+
+  Serial.println("WAITING FOR BABY UNIT...");
+
+  if (oledOK) {
+    display.clearDisplay();
+    display.setCursor(0, 15);
+    display.println("PARENT UNIT READY");
+    display.setCursor(0, 30);
+    display.println("WAITING FOR BABY...");
+    display.display();
+  }
 }
 
-//=====================================================
-// LOOP
-//=====================================================
+// =================================================
+// MAIN LOOP
+// =================================================
 
-void loop()
-{
-  // Check communication timeout
-  if (millis() - lastPacket > TIMEOUT)
-  {
-    Serial.println("COMMUNICATION LOST!");
+void loop() {
 
-    digitalWrite(ledPin, HIGH);
-    digitalWrite(motorPin, HIGH);
+  // Process incoming packet
+  processReceivedPacket();
 
-    // Slow buzzer beep
-    digitalWrite(buzzerPin, HIGH);
-    delay(500);
-    digitalWrite(buzzerPin, LOW);
-    delay(500);
+  // Connection timeout
+  if (!packetReceivedOnce ||
+      millis() - lastPacketTime > 2500) {
+
+    connected = false;
+
+  } else {
+
+    connected = true;
+
   }
-} ok
+
+  // Identify current alert
+  currentAlert = identifyAlert();
+
+  // Update output pattern
+  if (millis() - lastOutputUpdate >= 50) {
+
+    lastOutputUpdate = millis();
+
+    updateAlertOutputs();
+
+  }
+
+  // Update OLED
+  if (millis() - lastOLEDUpdate >= 250) {
+
+    lastOLEDUpdate = millis();
+
+    updateOLED();
+
+  }
+}

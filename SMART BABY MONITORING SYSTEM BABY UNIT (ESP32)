@@ -1,42 +1,46 @@
-
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_arduino_version.h>
 #include <DHT.h>
+#include <math.h>
 
-// ========================================
-// BABY MONITORING UNIT - ESP32 TRANSMITTER
-// ESP32 Arduino Core 3.3.11 compatible
-// ========================================
+// ================================================
+// BABY MONITORING UNIT
+// ESP32 + HC-SR04 + MAX4466 + DHT11
+// ESP-NOW UNICAST TRANSMITTER
+// ================================================
 
 // SENSOR PINS
-#define MIC_AO       34
-#define MIC_DO       27
+#define TRIG_PIN       5
+#define ECHO_PIN       18
+#define SOUND_PIN      34
+#define MIC_DIGITAL    27
+#define DHT_PIN        17
+#define DHT_TYPE       DHT11
 
-#define DHT_PIN      17
-#define DHT_TYPE     DHT11
-
-#define TRIG_PIN     5
-#define ECHO_PIN     18
-
-// SETTINGS
-#define BABY_DISTANCE_LIMIT 80.0
-#define CRY_THRESHOLD       100
-#define QUIET_THRESHOLD     70
-
+// COMMUNICATION
 #define ESPNOW_CHANNEL 1
 #define PACKET_MAGIC   0xBABE2026
 
+// YOUR PARENT ESP32 MAC ADDRESS
+uint8_t parentAddress[] = {
+  0xF0, 0x24, 0xF9, 0x5A, 0x27, 0x5C
+};
+
+// SENSOR SETTINGS
+#define DISTANCE_THRESHOLD 80.0
+#define CRY_THRESHOLD      100
+#define SILENCE_THRESHOLD  70
+
 DHT dht(DHT_PIN, DHT_TYPE);
 
-// ========================================
-// ESP-NOW PACKET
-// Must exactly match Parent Unit
-// ========================================
+// ================================================
+// PACKET STRUCTURE
+// MUST MATCH PARENT CODE EXACTLY
+// ================================================
 
 typedef struct __attribute__((packed)) {
-
   uint32_t magic;
   uint32_t sequence;
 
@@ -54,47 +58,69 @@ typedef struct __attribute__((packed)) {
 
 } BabyPacket;
 
+static_assert(sizeof(BabyPacket) == 27,
+              "Packet must be 27 bytes");
+
 BabyPacket packet;
 
-// BROADCAST MAC ADDRESS
-uint8_t broadcastAddress[] = {
-  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
-};
-
-// ========================================
+// ================================================
 // GLOBAL VARIABLES
-// ========================================
+// ================================================
 
 uint32_t sequenceNumber = 0;
 
+float temperature = 0;
+float humidity = 0;
+
+bool dhtValid = false;
 bool babyPresent = false;
 bool presenceValid = false;
 bool crying = false;
-bool dhtValid = false;
 
-float currentDistance = -1.0;
-float temperature = NAN;
-float humidity = NAN;
+uint8_t presenceCount = 0;
+uint8_t absenceCount = 0;
 
-uint16_t soundPeakToPeak = 0;
+uint8_t cryCount = 0;
+uint8_t quietCount = 0;
 
-int presenceCount = 0;
-int absenceCount = 0;
+uint32_t lastDHTRead = 0;
+uint32_t lastSend = 0;
+uint32_t lastDebug = 0;
 
-int cryCount = 0;
-int silenceCount = 0;
+const uint32_t SEND_INTERVAL = 250;
 
-unsigned long lastDHTRead = 0;
-unsigned long lastTransmit = 0;
+volatile bool callbackReceived = false;
+volatile esp_now_send_status_t lastSendStatus =
+    ESP_NOW_SEND_FAIL;
 
-// ========================================
-// ULTRASONIC SENSOR
-// ========================================
+// ================================================
+// ESP-NOW SEND CALLBACK
+// ================================================
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+
+void onDataSent(const wifi_tx_info_t *tx_info,
+                esp_now_send_status_t status) {
+
+#else
+
+void onDataSent(const uint8_t *mac_addr,
+                esp_now_send_status_t status) {
+
+#endif
+
+  lastSendStatus = status;
+  callbackReceived = true;
+}
+
+// ================================================
+// DISTANCE SENSOR
+// ================================================
 
 float readDistance() {
 
   digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(3);
+  delayMicroseconds(2);
 
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
@@ -102,44 +128,52 @@ float readDistance() {
   digitalWrite(TRIG_PIN, LOW);
 
   unsigned long duration =
-    pulseIn(ECHO_PIN, HIGH, 25000);
+      pulseIn(ECHO_PIN, HIGH, 25000);
 
   if (duration == 0) {
-    return -1.0;
+    return -1;
   }
 
   float distance = duration * 0.0343 / 2.0;
 
-  if (distance < 2.0 || distance > 400.0) {
-    return -1.0;
+  if (distance < 2 || distance > 400) {
+    return -1;
   }
 
   return distance;
 }
 
-// ========================================
-// BABY PRESENCE DETECTION
-// ========================================
+// ================================================
+// BABY PRESENCE
+// ================================================
 
-void updatePresence() {
+void updatePresence(float distance) {
 
-  currentDistance = readDistance();
-
-  if (currentDistance < 0) {
+  if (distance < 0) {
 
     presenceValid = false;
 
-    // Invalid distance is a sensor error.
-    // Do not automatically declare baby missing.
+    if (absenceCount < 3) {
+      absenceCount++;
+    }
+
+    presenceCount = 0;
+
+    if (absenceCount >= 3) {
+      babyPresent = false;
+    }
 
     return;
   }
 
   presenceValid = true;
 
-  if (currentDistance < BABY_DISTANCE_LIMIT) {
+  if (distance < DISTANCE_THRESHOLD) {
 
-    presenceCount++;
+    if (presenceCount < 3) {
+      presenceCount++;
+    }
+
     absenceCount = 0;
 
     if (presenceCount >= 3) {
@@ -148,7 +182,10 @@ void updatePresence() {
 
   } else {
 
-    absenceCount++;
+    if (absenceCount < 3) {
+      absenceCount++;
+    }
+
     presenceCount = 0;
 
     if (absenceCount >= 3) {
@@ -157,9 +194,9 @@ void updatePresence() {
   }
 }
 
-// ========================================
-// MICROPHONE ANALOG READING
-// ========================================
+// ================================================
+// MICROPHONE
+// ================================================
 
 uint16_t readSoundLevel() {
 
@@ -168,7 +205,7 @@ uint16_t readSoundLevel() {
 
   for (int i = 0; i < 100; i++) {
 
-    int value = analogRead(MIC_AO);
+    int value = analogRead(SOUND_PIN);
 
     if (value < minimumValue) {
       minimumValue = value;
@@ -178,48 +215,52 @@ uint16_t readSoundLevel() {
       maximumValue = value;
     }
 
-    delayMicroseconds(500);
+    delayMicroseconds(200);
   }
 
   return maximumValue - minimumValue;
 }
 
-// ========================================
-// CRYING DETECTION
-// ========================================
+// ================================================
+// CRY DETECTION
+// ================================================
 
-void updateCrying() {
+void updateCrying(uint16_t soundLevel) {
 
-  soundPeakToPeak = readSoundLevel();
+  if (soundLevel >= CRY_THRESHOLD) {
 
-  if (soundPeakToPeak >= CRY_THRESHOLD) {
+    if (cryCount < 2) {
+      cryCount++;
+    }
 
-    cryCount++;
-    silenceCount = 0;
+    quietCount = 0;
 
     if (cryCount >= 2) {
       crying = true;
     }
 
-  } else if (soundPeakToPeak < QUIET_THRESHOLD) {
+  } else if (soundLevel < SILENCE_THRESHOLD) {
 
-    silenceCount++;
+    if (quietCount < 3) {
+      quietCount++;
+    }
+
     cryCount = 0;
 
-    if (silenceCount >= 3) {
+    if (quietCount >= 3) {
       crying = false;
     }
 
   } else {
 
     cryCount = 0;
-    silenceCount = 0;
+    quietCount = 0;
   }
 }
 
-// ========================================
-// DHT11 SENSOR
-// ========================================
+// ================================================
+// DHT11
+// ================================================
 
 void readDHT() {
 
@@ -235,62 +276,33 @@ void readDHT() {
 
       temperature = newTemperature;
       humidity = newHumidity;
-
       dhtValid = true;
 
     } else {
 
       dhtValid = false;
+      Serial.println("DHT11 READ ERROR");
     }
   }
 }
 
-// ========================================
-// ESP-NOW SEND CALLBACK
-// CORE 2.X AND 3.X COMPATIBLE
-// ========================================
+// ================================================
+// SEND DATA TO PARENT ESP32
+// ================================================
 
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-
-void onDataSent(
-  const wifi_tx_info_t *tx_info,
-  esp_now_send_status_t status
-) {
-
-#else
-
-void onDataSent(
-  const uint8_t *mac_addr,
-  esp_now_send_status_t status
-) {
-
-#endif
-
-  Serial.print("ESP-NOW Send Status: ");
-
-  if (status == ESP_NOW_SEND_SUCCESS) {
-    Serial.println("SUCCESS");
-  } else {
-    Serial.println("FAILED");
-  }
-}
-
-// ========================================
-// TRANSMIT DATA
-// ========================================
-
-void transmitData() {
+void sendBabyData(float distance,
+                  uint16_t soundLevel) {
 
   packet.magic = PACKET_MAGIC;
   packet.sequence = ++sequenceNumber;
 
-  packet.distanceCm = currentDistance;
+  packet.distanceCm = distance;
   packet.temperature = temperature;
   packet.humidity = humidity;
 
-  packet.soundPeakToPeak = soundPeakToPeak;
+  packet.soundPeakToPeak = soundLevel;
 
-  packet.micDigital = digitalRead(MIC_DO);
+  packet.micDigital = digitalRead(MIC_DIGITAL);
 
   packet.babyPresent = babyPresent;
   packet.presenceValid = presenceValid;
@@ -299,36 +311,51 @@ void transmitData() {
   packet.dhtValid = dhtValid;
 
   esp_err_t result = esp_now_send(
-    broadcastAddress,
-    (uint8_t *)&packet,
-    sizeof(packet)
+      parentAddress,
+      (uint8_t *)&packet,
+      sizeof(packet)
   );
 
-  // SERIAL DEBUGGING
+  Serial.print("ESP-NOW Send: ");
 
-  Serial.println("\n========== BABY UNIT ==========");
+  if (result == ESP_OK) {
+
+    Serial.println("QUEUED");
+
+  } else {
+
+    Serial.print("ERROR: ");
+    Serial.println(esp_err_to_name(result));
+  }
+}
+
+// ================================================
+// DEBUG OUTPUT
+// ================================================
+
+void printBabyData(float distance,
+                   uint16_t soundLevel) {
+
+  Serial.println();
+  Serial.println("------ BABY DATA ------");
 
   Serial.print("Sequence: ");
   Serial.println(sequenceNumber);
 
   Serial.print("Distance: ");
-  Serial.print(currentDistance);
-  Serial.println(" cm");
-
-  Serial.print("Presence Valid: ");
-  Serial.println(presenceValid ? "YES" : "NO");
+  Serial.println(distance);
 
   Serial.print("Baby Present: ");
   Serial.println(babyPresent ? "YES" : "NO");
 
-  Serial.print("Sound Peak-to-Peak: ");
-  Serial.println(soundPeakToPeak);
-
-  Serial.print("Microphone DO: ");
-  Serial.println(digitalRead(MIC_DO));
+  Serial.print("Presence Valid: ");
+  Serial.println(presenceValid);
 
   Serial.print("Crying: ");
   Serial.println(crying ? "YES" : "NO");
+
+  Serial.print("Sound Level: ");
+  Serial.println(soundLevel);
 
   Serial.print("Temperature: ");
   Serial.println(temperature);
@@ -336,99 +363,161 @@ void transmitData() {
   Serial.print("Humidity: ");
   Serial.println(humidity);
 
-  Serial.print("Send Request: ");
+  Serial.print("DHT Valid: ");
+  Serial.println(dhtValid);
 
-  Serial.println(
-    result == ESP_OK ? "ACCEPTED" : "ERROR"
-  );
-
-  Serial.println("===============================");
+  Serial.println("-----------------------");
 }
 
-// ========================================
+// ================================================
 // SETUP
-// ========================================
+// ================================================
 
 void setup() {
 
   Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("BABY UNIT STARTING");
+  Serial.println("================================");
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  pinMode(MIC_DO, INPUT);
+  pinMode(SOUND_PIN, INPUT);
+  pinMode(MIC_DIGITAL, INPUT);
 
   analogReadResolution(12);
 
   dht.begin();
 
+  // WIFI STATION MODE
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
-  esp_wifi_set_channel(
-    ESPNOW_CHANNEL,
-    WIFI_SECOND_CHAN_NONE
-  );
+  delay(200);
 
-  Serial.println("\nBABY UNIT STARTING");
-
-  Serial.print("Baby Unit MAC Address: ");
+  Serial.print("Baby MAC: ");
   Serial.println(WiFi.macAddress());
 
-  // INITIALIZE ESP-NOW
+  esp_wifi_set_ps(WIFI_PS_NONE);
 
+  // SET CHANNEL
+  esp_err_t channelResult = esp_wifi_set_channel(
+      ESPNOW_CHANNEL,
+      WIFI_SECOND_CHAN_NONE
+  );
+
+  Serial.print("Channel Setup: ");
+  Serial.println(esp_err_to_name(channelResult));
+
+  uint8_t actualChannel;
+  wifi_second_chan_t secondaryChannel;
+
+  esp_wifi_get_channel(
+      &actualChannel,
+      &secondaryChannel
+  );
+
+  Serial.print("Actual Channel: ");
+  Serial.println(actualChannel);
+
+  // INITIALIZE ESP-NOW
   if (esp_now_init() != ESP_OK) {
 
-    Serial.println("ESP-NOW INITIALIZATION FAILED");
+    Serial.println("ESP-NOW INIT FAILED");
 
-    return;
+    while (true) {
+      delay(1000);
+    }
   }
 
+  Serial.println("ESP-NOW INITIALIZED");
+
   // REGISTER SEND CALLBACK
+  esp_err_t callbackResult =
+      esp_now_register_send_cb(onDataSent);
 
-  esp_now_register_send_cb(onDataSent);
+  Serial.print("Callback Registration: ");
+  Serial.println(esp_err_to_name(callbackResult));
 
-  // ADD BROADCAST PEER
-
+  // ADD PARENT AS PEER
   esp_now_peer_info_t peerInfo = {};
 
   memcpy(
-    peerInfo.peer_addr,
-    broadcastAddress,
-    6
+      peerInfo.peer_addr,
+      parentAddress,
+      6
   );
 
   peerInfo.channel = ESPNOW_CHANNEL;
   peerInfo.encrypt = false;
+  peerInfo.ifidx = WIFI_IF_STA;
 
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+  esp_err_t peerResult =
+      esp_now_add_peer(&peerInfo);
 
-    Serial.println("FAILED TO ADD ESP-NOW PEER");
+  Serial.print("Parent Peer Addition: ");
+  Serial.println(esp_err_to_name(peerResult));
 
-    return;
+  if (peerResult != ESP_OK) {
+
+    Serial.println("PARENT PEER ADD FAILED");
+
+    while (true) {
+      delay(1000);
+    }
   }
 
-  Serial.println("ESP-NOW INITIALIZED");
-  Serial.println("CHANNEL: 1");
+  Serial.println("PARENT PEER ADDED");
   Serial.println("BABY UNIT READY");
 }
 
-// ========================================
+// ================================================
 // MAIN LOOP
-// ========================================
+// ================================================
 
 void loop() {
 
-  updatePresence();
+  float distance = readDistance();
 
-  updateCrying();
+  updatePresence(distance);
+
+  uint16_t soundLevel = readSoundLevel();
+
+  updateCrying(soundLevel);
 
   readDHT();
 
-  if (millis() - lastTransmit >= 250) {
+  // TRANSMIT EVERY 250 MS
+  if (millis() - lastSend >= SEND_INTERVAL) {
 
-    lastTransmit = millis();
+    lastSend = millis();
 
-    transmitData();
+    sendBabyData(distance, soundLevel);
+  }
+
+  // DELIVERY CALLBACK STATUS
+  if (callbackReceived) {
+
+    callbackReceived = false;
+
+    Serial.print("Delivery Status: ");
+
+    if (lastSendStatus == ESP_NOW_SEND_SUCCESS) {
+      Serial.println("SUCCESS");
+    } else {
+      Serial.println("FAIL");
+    }
+  }
+
+  // SENSOR DEBUG EVERY SECOND
+  if (millis() - lastDebug >= 1000) {
+
+    lastDebug = millis();
+
+    printBabyData(distance, soundLevel);
   }
 }
